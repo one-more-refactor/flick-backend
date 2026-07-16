@@ -1,0 +1,10 @@
+[package]
+name = "flick-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "flick reading engine: text -> ORP-pivoted, weight-timed reading timeline"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
