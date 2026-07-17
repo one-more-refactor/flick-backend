@@ -16,6 +16,14 @@ async fn main() {
     if config.oidc.is_some() {
         tracing::info!(name = %config.oidc_name, "OIDC SSO enabled (lazy discovery)");
     }
+    if config.web_dist.join("index.html").is_file() {
+        tracing::info!(dir = %config.web_dist.display(), "serving web client");
+    } else {
+        tracing::warn!(
+            dir = %config.web_dist.display(),
+            "web dist not found — build it (cd web && bun run build) or set FLICK_WEB_DIST"
+        );
+    }
     let state = AppState::new(db, config);
 
     let listener = tokio::net::TcpListener::bind(&addr)

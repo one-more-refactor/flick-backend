@@ -446,7 +446,7 @@ async fn missing_web_dist_serves_plain_text() {
     let resp = send(&app, bare_request("GET", "/", None)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-    assert_eq!(&bytes[..], b"flick-server: web dist not found");
+    assert!(bytes.starts_with(b"flick-server: web dist not found"));
 }
 
 // ------------------------------------------------------- v0.2: profile

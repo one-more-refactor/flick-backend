@@ -19,6 +19,22 @@ pub struct Config {
     pub oidc_name: String,
 }
 
+/// Default web dist (CONTRACTS.md): first of `./web/dist`, `../web/dist`
+/// containing an `index.html`, so the server finds the client whether it is
+/// launched from the repo root (`cargo run -p flick-server`) or from
+/// `server/`. Falls back to `./web/dist` so the "not found" notice names a
+/// sensible path.
+fn default_web_dist() -> PathBuf {
+    let candidates = ["./web/dist", "../web/dist"];
+    for dir in candidates {
+        let dir = PathBuf::from(dir);
+        if dir.join("index.html").is_file() {
+            return dir;
+        }
+    }
+    candidates[0].into()
+}
+
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -50,8 +66,8 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             web_dist: env_var("FLICK_WEB_DIST")
-                .unwrap_or_else(|| "../web/dist".into())
-                .into(),
+                .map(PathBuf::from)
+                .unwrap_or_else(default_web_dist),
             oidc,
             oidc_name: env_var("FLICK_OIDC_NAME").unwrap_or_else(|| "SSO".into()),
         }

@@ -79,7 +79,12 @@ async fn no_web_dist(uri: Uri) -> Response {
     } else {
         StatusCode::NOT_FOUND
     };
-    (status, "flick-server: web dist not found").into_response()
+    (
+        status,
+        "flick-server: web dist not found — build it (cd web && bun run build), \
+         run from the repo root, or set FLICK_WEB_DIST",
+    )
+        .into_response()
 }
 
 fn api_router() -> Router<AppState> {
