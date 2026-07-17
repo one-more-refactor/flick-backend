@@ -5,4 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+argon2 = "0.5"
+axum = { version = "0.8", features = ["multipart"] }
 flick-core = { path = "../core" }
+openidconnect = "4"
+pdf-extract = "0.12.0"
+rand = "0.8"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
