@@ -5,10 +5,13 @@
 
 pub mod auth;
 pub mod books;
+pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod mail;
 pub mod oidc;
+pub mod stats;
 
 use std::sync::Arc;
 
@@ -29,7 +32,7 @@ use crate::error::AppError;
 pub struct AppState {
     pub db: db::Db,
     pub config: Arc<Config>,
-    pub oidc: Arc<oidc::OidcRuntime>,
+    pub oauth: Arc<oidc::OauthRuntime>,
 }
 
 impl AppState {
@@ -37,7 +40,7 @@ impl AppState {
         AppState {
             db,
             config: Arc::new(config),
-            oidc: Arc::new(oidc::OidcRuntime::default()),
+            oauth: Arc::new(oidc::OauthRuntime::default()),
         }
     }
 }
@@ -89,13 +92,19 @@ async fn no_web_dist(uri: Uri) -> Response {
 
 fn api_router() -> Router<AppState> {
     Router::new()
+        .route("/auth/guest", post(auth::guest))
+        .route("/auth/lookup", post(auth::lookup))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
+        .route("/auth/code/request", post(auth::code_request))
+        .route("/auth/code/verify", post(auth::code_verify))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me).patch(auth::update_me))
         .route("/auth/providers", get(auth::providers))
-        .route("/auth/oidc/login", get(oidc::login))
-        .route("/auth/oidc/callback", get(oidc::callback))
+        .route("/auth/oauth/{provider}/login", get(oidc::login))
+        .route("/auth/oauth/{provider}/callback", get(oidc::callback))
+        .route("/auth/oidc/login", get(oidc::oidc_login_alias))
+        .route("/auth/oidc/callback", get(oidc::oidc_callback_alias))
         .route("/books", get(books::list).post(books::create))
         .route(
             "/books/{id}",
@@ -103,6 +112,13 @@ fn api_router() -> Router<AppState> {
         )
         .route("/books/{id}/timeline", get(books::timeline))
         .route("/books/{id}/position", put(books::set_position))
+        .route("/stats", get(stats::stats))
+        .route(
+            "/sessions",
+            get(stats::list_sessions).post(stats::create_session),
+        )
+        .route("/catalog", get(catalog::list))
+        .route("/catalog/{slug}/add", post(catalog::add))
         .fallback(api_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
         .layer(DefaultBodyLimit::max(books::UPLOAD_LIMIT))

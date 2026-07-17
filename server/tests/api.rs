@@ -13,7 +13,7 @@ use flick_server::config::Config;
 use flick_server::db::Db;
 use flick_server::{app, AppState};
 
-fn test_app() -> (Router, tempfile::TempDir) {
+fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
         addr: "127.0.0.1:0".into(),
@@ -22,9 +22,21 @@ fn test_app() -> (Router, tempfile::TempDir) {
         web_dist: dir.path().join("no-such-dist"),
         oidc: None,
         oidc_name: "SSO".into(),
+        oauth_google: None,
+        oauth_github: None,
+        smtp_url: None,
+        smtp_from: "flick <no-reply@localhost>".into(),
+        dropbox_app_key: None,
+        google_picker_api_key: None,
     };
     let db = Db::open(&config.data_dir).expect("open db");
-    (app(AppState::new(db, config)), dir)
+    let state = AppState::new(db, config);
+    (app(state.clone()), state, dir)
+}
+
+fn test_app() -> (Router, tempfile::TempDir) {
+    let (app, _state, dir) = test_app_with_state();
+    (app, dir)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> Response {
@@ -425,11 +437,20 @@ async fn providers_reflects_disabled_oidc() {
     let resp = send(&app, bare_request("GET", "/api/auth/providers", None)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body, json!({"oidc": {"enabled": false, "name": "SSO"}}));
+    assert_eq!(body, json!({"providers": []}));
 
-    // OIDC login is 404 when unconfigured
-    let resp = send(&app, bare_request("GET", "/api/auth/oidc/login", None)).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // OAuth logins are 404 when unconfigured (alias + registry routes), and
+    // unknown providers are 404 always.
+    for uri in [
+        "/api/auth/oidc/login",
+        "/api/auth/oauth/oidc/login",
+        "/api/auth/oauth/google/login",
+        "/api/auth/oauth/github/login",
+        "/api/auth/oauth/myspace/login",
+    ] {
+        let resp = send(&app, bare_request("GET", uri, None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -459,8 +480,11 @@ async fn new_user_defaults_and_starter_book() {
     let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
     assert_eq!(me["onboarded"], false);
     assert_eq!(me["username"], Value::Null);
+    assert_eq!(me["guest"], false);
     assert_eq!(me["settings"]["wpm"], 350);
     assert_eq!(me["settings"]["theme"], "auto");
+    assert_eq!(me["settings"]["accent"], "red");
+    assert_eq!(me["settings"]["lang"], "auto");
 
     let books =
         body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
@@ -541,4 +565,480 @@ async fn patch_me_validation() {
     let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
     assert_eq!(me["username"], Value::Null);
     assert_eq!(me["settings"]["wpm"], 350);
+}
+
+// --------------------------------------------------------- v0.3: guests
+
+#[tokio::test]
+async fn guest_create_first_add_and_merge_on_register() {
+    let (app, _dir) = test_app();
+
+    // Anonymous session: a real user row, no email, no intro book yet.
+    let resp = send(&app, bare_request("POST", "/api/auth/guest", None)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let guest_cookie = session_cookie(&resp);
+    let guest = body_json(resp).await;
+    assert_eq!(guest["guest"], true);
+    assert_eq!(guest["email"], Value::Null);
+    assert_eq!(guest["name"], "READER");
+    let books =
+        body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
+    assert_eq!(books.as_array().map(Vec::len), Some(0));
+
+    // First add seeds the intro book alongside it.
+    let book = create_paste_book(&app, &guest_cookie, Some("Mine"), "Guest words go here.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+    let books =
+        body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
+    let books = books.as_array().expect("array");
+    assert_eq!(books.len(), 2);
+    assert_eq!(books.iter().filter(|b| b["source"] == "intro").count(), 1);
+
+    // A second add does NOT seed another intro.
+    create_paste_book(&app, &guest_cookie, Some("More"), "Even more guest words.").await;
+    let books =
+        body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
+    assert_eq!(books.as_array().map(Vec::len), Some(3));
+
+    // Reading as a guest: position + stats live on the guest row.
+    let resp = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/books/{id}/position"),
+            Some(&guest_cookie),
+            json!({"position": 2, "read": 350}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Register while the guest cookie is present → everything merges.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            Some(&guest_cookie),
+            json!({"email": "merged@example.com", "password": "hunter22hunter22", "name": "M"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cookie = session_cookie(&resp);
+    let user = body_json(resp).await;
+    assert_eq!(user["guest"], false);
+    assert_eq!(user["email"], "merged@example.com");
+
+    // Books moved over; exactly ONE intro book (no duplicate).
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let books = books.as_array().expect("array");
+    assert_eq!(books.len(), 3); // intro + Mine + More
+    assert_eq!(books.iter().filter(|b| b["source"] == "intro").count(), 1);
+    assert!(books.iter().any(|b| b["id"] == id.as_str()));
+
+    // Stats moved over too.
+    let stats = body_json(send(&app, bare_request("GET", "/api/stats", Some(&cookie))).await).await;
+    assert_eq!(stats["total_words"], 350);
+
+    // The guest row is gone: its session no longer resolves.
+    let resp = send(&app, bare_request("GET", "/api/auth/me", Some(&guest_cookie))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ----------------------------------------------- v0.3: email-first flow
+
+#[tokio::test]
+async fn lookup_known_and_unknown_email() {
+    let (app, _dir) = test_app();
+    register(&app, "known@example.com").await;
+
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/lookup", None, json!({"email": "KNOWN@example.com"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["exists"], true);
+    assert_eq!(body["methods"], json!(["password", "code"]));
+
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/lookup", None, json!({"email": "nobody@example.com"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["exists"], false);
+    assert_eq!(body["methods"], json!([]));
+}
+
+#[tokio::test]
+async fn login_code_roundtrip() {
+    let (app, state, _dir) = test_app_with_state();
+    register(&app, "code@example.com").await;
+
+    // The request endpoint is a silent 204 for known and unknown emails.
+    for email in ["code@example.com", "nobody@example.com"] {
+        let resp = send(
+            &app,
+            json_request("POST", "/api/auth/code/request", None, json!({"email": email})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // Mint a known code directly (the handler only ever logs/mails it).
+    let code = flick_server::auth::issue_login_code(&state.db, "code@example.com")
+        .await
+        .expect("issue code");
+    assert_eq!(code.len(), 6);
+
+    // Wrong code, unknown email → identical 400s.
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    for (email, c) in [("code@example.com", wrong), ("nobody@example.com", &code)] {
+        let resp = send(
+            &app,
+            json_request("POST", "/api/auth/code/verify", None, json!({"email": email, "code": c})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "invalid code");
+    }
+
+    // Correct code logs in and sets a session.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "code@example.com", "code": code}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = session_cookie(&resp);
+    assert_eq!(body_json(resp).await["email"], "code@example.com");
+    let resp = send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Single-use: the same code is dead now.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "code@example.com", "code": code}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Five bad attempts invalidate a code even if the sixth try is correct.
+    let code = flick_server::auth::issue_login_code(&state.db, "code@example.com")
+        .await
+        .expect("issue code");
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    for _ in 0..5 {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/code/verify",
+                None,
+                json!({"email": "code@example.com", "code": wrong}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "code@example.com", "code": code}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ------------------------------------------------ v0.3: accent + lang
+
+#[tokio::test]
+async fn patch_me_accent_and_lang() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "accent@example.com").await;
+
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"settings": {"accent": "cyan", "lang": "de"}}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = body_json(resp).await;
+    assert_eq!(me["settings"]["accent"], "cyan");
+    assert_eq!(me["settings"]["lang"], "de");
+
+    // Persisted, not just echoed.
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["settings"]["accent"], "cyan");
+    assert_eq!(me["settings"]["lang"], "de");
+
+    for (body, needle) in [
+        (json!({"settings": {"accent": "pink"}}), "accent"),
+        (json!({"settings": {"lang": "fr"}}), "lang"),
+    ] {
+        let resp = send(&app, json_request("PATCH", "/api/auth/me", Some(&cookie), body)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(resp).await;
+        assert!(
+            err["error"].as_str().expect("msg").contains(needle),
+            "error should mention {needle}: {err}"
+        );
+    }
+}
+
+// ---------------------------------------------------------- v0.3: stats
+
+#[tokio::test]
+async fn stats_accumulate_and_streak() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "stats@example.com").await;
+    let book = create_paste_book(&app, &cookie, Some("S"), "Some words to read here.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+    let uri = format!("/api/books/{id}/position");
+
+    // Report reads for yesterday and today (both above the 300 goal).
+    for (day, read) in [
+        (Some(flick_server::stats::utc_day(-1)), 400),
+        (None, 350),
+    ] {
+        let mut body = json!({"position": 1, "read": read});
+        if let Some(d) = day {
+            body["day"] = json!(d);
+        }
+        let resp = send(&app, json_request("PUT", &uri, Some(&cookie), body)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    let stats = body_json(send(&app, bare_request("GET", "/api/stats", Some(&cookie))).await).await;
+    assert_eq!(stats["goal"], 300);
+    assert_eq!(stats["today"]["day"], flick_server::stats::utc_day(0));
+    assert_eq!(stats["today"]["words"], 350);
+    assert_eq!(stats["total_words"], 750);
+    assert_eq!(stats["streak"]["current"], 2);
+    assert_eq!(stats["streak"]["best"], 2);
+    let days = stats["days"].as_array().expect("days");
+    assert_eq!(days.len(), 2);
+    assert_eq!(days[0]["words"], 400); // oldest first
+    assert_eq!(days[1]["words"], 350);
+
+    // read is clamped to 500 per report.
+    let resp = send(
+        &app,
+        json_request("PUT", &uri, Some(&cookie), json!({"position": 1, "read": 9999})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let stats = body_json(send(&app, bare_request("GET", "/api/stats", Some(&cookie))).await).await;
+    assert_eq!(stats["today"]["words"], 850);
+
+    // Days too far from the server date (and garbage days) are rejected.
+    for day in [
+        json!(flick_server::stats::utc_day(-5)),
+        json!(flick_server::stats::utc_day(3)),
+        json!("2026-02-30"),
+        json!("not-a-date"),
+    ] {
+        let resp = send(
+            &app,
+            json_request(
+                "PUT",
+                &uri,
+                Some(&cookie),
+                json!({"position": 1, "read": 10, "day": day}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "day {day}");
+    }
+}
+
+#[tokio::test]
+async fn position_bumps_last_read_at() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "lastread@example.com").await;
+    let book = create_paste_book(&app, &cookie, Some("L"), "A few words to read.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+    assert_eq!(book["last_read_at"], Value::Null);
+
+    let resp = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/books/{id}/position"),
+            Some(&cookie),
+            json!({"position": 2}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let got = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}"), Some(&cookie))).await)
+        .await;
+    let last_read = got["last_read_at"].as_i64().expect("last_read_at set");
+    assert!(last_read >= got["created_at"].as_i64().expect("created_at"));
+}
+
+// ------------------------------------------------------- v0.3: sessions
+
+#[tokio::test]
+async fn sessions_post_list_and_clamps() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "sessions@example.com").await;
+    let book = create_paste_book(&app, &cookie, Some("Session Book"), "Words for a session.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+
+    // A sane session is stored as-is.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/sessions",
+            Some(&cookie),
+            json!({"book_id": id, "started_at": 1700000000, "duration_ms": 60000, "words": 300, "avg_wpm": 300}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // An absurd one gets sanity-clamped (duration ≤ 6h, wpm ≤ 1500,
+    // words within duration×wpm ±50%).
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/sessions",
+            Some(&cookie),
+            json!({"book_id": id, "started_at": 1700000001, "duration_ms": 99999999999i64, "words": 1, "avg_wpm": 99999}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let list = body_json(send(&app, bare_request("GET", "/api/sessions?limit=50", Some(&cookie))).await)
+        .await;
+    let list = list.as_array().expect("array");
+    assert_eq!(list.len(), 2);
+    // Newest first.
+    assert_eq!(list[0]["started_at"], 1700000001);
+    assert_eq!(list[0]["duration_ms"], 6 * 60 * 60 * 1000);
+    assert_eq!(list[0]["avg_wpm"], 1500);
+    // 6h at 1500 wpm = 540000 expected words; 1 clamps to the −50% floor.
+    assert_eq!(list[0]["words"], 270000);
+    assert_eq!(list[1]["book_title"], "Session Book");
+    assert_eq!(list[1]["words"], 300);
+
+    // Negative inputs are rejected outright.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/sessions",
+            Some(&cookie),
+            json!({"book_id": id, "started_at": 0, "duration_ms": -5, "words": 10, "avg_wpm": 300}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Deleting the book keeps the feed working with a DELETED marker.
+    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
+    assert_eq!(list[0]["book_title"], "DELETED");
+    assert_eq!(list[1]["book_title"], "DELETED");
+}
+
+// -------------------------------------------------------- v0.3: catalog
+
+#[tokio::test]
+async fn catalog_list_add_and_duplicate() {
+    let (app, _dir) = test_app();
+
+    // Public: no auth required, every entry carries a word count.
+    let resp = send(&app, bare_request("GET", "/api/catalog", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let catalog = body_json(resp).await;
+    let catalog = catalog.as_array().expect("array");
+    assert_eq!(catalog.len(), 9);
+    for entry in catalog {
+        assert!(entry["word_count"].as_i64().expect("word_count") > 0, "{entry}");
+    }
+    let magi = catalog
+        .iter()
+        .find(|e| e["slug"] == "gift-of-the-magi")
+        .expect("magi in catalog");
+    assert_eq!(magi["author"], "O. Henry");
+    assert_eq!(magi["kind"], "story");
+
+    // Adding requires auth.
+    let resp = send(&app, bare_request("POST", "/api/catalog/gift-of-the-magi/add", None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let cookie = register(&app, "catalog@example.com").await;
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "catalog");
+    assert_eq!(book["title"], "The Gift of the Magi");
+    assert_eq!(book["author"], "O. Henry");
+    assert_eq!(book["category"], "story");
+    let book_id = book["id"].as_str().expect("id").to_string();
+    assert_eq!(book["word_count"], magi["word_count"]);
+
+    // The copied timeline is playable.
+    let resp = send(
+        &app,
+        bare_request("GET", &format!("/api/books/{book_id}/timeline"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["version"], 1);
+
+    // Duplicate add → 409 carrying the existing book id.
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(body["error"].is_string());
+    assert_eq!(body["book_id"], book_id.as_str());
+
+    // Unknown slug → 404. Novella kind maps to the "book" category.
+    let resp = send(&app, bare_request("POST", "/api/catalog/nope/add", Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/die-verwandlung/add", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["category"], "book");
 }

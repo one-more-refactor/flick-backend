@@ -44,6 +44,79 @@ ALTER TABLE users ADD COLUMN wpm INTEGER NOT NULL DEFAULT 350;
 ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'auto';
 ";
 
+/// v0.3: guests (nullable email forces a users-table rebuild), settings
+/// accent/lang, book metadata, identities (multi-provider OAuth), reading
+/// stats, login codes, and the catalog timeline cache. The legacy
+/// `users.oidc_sub` column is kept (SQLite can't drop it cheaply) but its
+/// values migrate into `identities` and it is never read again.
+const SCHEMA_V3: &str = "
+CREATE TABLE users_v3 (
+    id            TEXT PRIMARY KEY,
+    email         TEXT UNIQUE,
+    name          TEXT NOT NULL,
+    password_hash TEXT,
+    oidc_sub      TEXT UNIQUE,
+    created_at    INTEGER NOT NULL,
+    username      TEXT,
+    onboarded     INTEGER NOT NULL DEFAULT 0,
+    wpm           INTEGER NOT NULL DEFAULT 350,
+    theme         TEXT NOT NULL DEFAULT 'auto',
+    guest         INTEGER NOT NULL DEFAULT 0,
+    accent        TEXT NOT NULL DEFAULT 'red',
+    lang          TEXT NOT NULL DEFAULT 'auto'
+);
+INSERT INTO users_v3 (id, email, name, password_hash, oidc_sub, created_at,
+                      username, onboarded, wpm, theme)
+    SELECT id, email, name, password_hash, oidc_sub, created_at,
+           username, onboarded, wpm, theme
+    FROM users;
+DROP TABLE users;
+ALTER TABLE users_v3 RENAME TO users;
+ALTER TABLE books ADD COLUMN last_read_at INTEGER;
+ALTER TABLE books ADD COLUMN author TEXT;
+ALTER TABLE books ADD COLUMN url TEXT;
+ALTER TABLE books ADD COLUMN favicon TEXT;
+ALTER TABLE books ADD COLUMN excerpt TEXT;
+ALTER TABLE books ADD COLUMN category TEXT;
+ALTER TABLE books ADD COLUMN catalog_slug TEXT;
+CREATE TABLE identities (
+    provider TEXT NOT NULL,
+    sub      TEXT NOT NULL,
+    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email    TEXT,
+    PRIMARY KEY (provider, sub)
+);
+INSERT INTO identities (provider, sub, user_id, email)
+    SELECT 'oidc', oidc_sub, id, email FROM users WHERE oidc_sub IS NOT NULL;
+CREATE TABLE reading_days (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day     TEXT NOT NULL,
+    words   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+CREATE TABLE sessions_log (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    book_id     TEXT NOT NULL,
+    started_at  INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    words       INTEGER NOT NULL,
+    avg_wpm     INTEGER NOT NULL
+);
+CREATE INDEX sessions_log_user ON sessions_log(user_id, started_at);
+CREATE TABLE login_codes (
+    email      TEXT PRIMARY KEY,
+    code_hash  TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE catalog_cache (
+    slug       TEXT PRIMARY KEY,
+    timeline   BLOB NOT NULL,
+    word_count INTEGER NOT NULL
+);
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -69,6 +142,16 @@ impl Db {
         if version < 2 {
             conn.execute_batch(SCHEMA_V2)?;
             conn.pragma_update(None, "user_version", 2)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 3 {
+            // The users-table rebuild needs FK enforcement off (standard
+            // SQLite table-rebuild dance); the batch itself is transactional.
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let migrated = conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V3}\nCOMMIT;"));
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            migrated?;
+            conn.pragma_update(None, "user_version", 3)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -105,13 +188,16 @@ pub fn now_secs() -> i64 {
 #[derive(Debug, Clone)]
 pub struct User {
     pub id: String,
-    pub email: String,
+    pub email: Option<String>,
     pub name: String,
     pub password_hash: Option<String>,
     pub username: Option<String>,
     pub onboarded: bool,
     pub wpm: i64,
     pub theme: String,
+    pub guest: bool,
+    pub accent: String,
+    pub lang: String,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -124,10 +210,16 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         onboarded: r.get::<_, i64>(5)? != 0,
         wpm: r.get(6)?,
         theme: r.get(7)?,
+        guest: r.get::<_, i64>(8)? != 0,
+        accent: r.get(9)?,
+        lang: r.get(10)?,
     })
 }
 
-const USER_COLS: &str = "id, email, name, password_hash, username, onboarded, wpm, theme";
+const USER_COLS: &str =
+    "id, email, name, password_hash, username, onboarded, wpm, theme, guest, accent, lang";
+const USER_COLS_U: &str = "u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, \
+                           u.wpm, u.theme, u.guest, u.accent, u.lang";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -138,31 +230,24 @@ pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<Use
     .optional()
 }
 
-pub fn user_by_oidc_sub(c: &Connection, sub: &str) -> rusqlite::Result<Option<User>> {
-    c.query_row(
-        &format!("SELECT {USER_COLS} FROM users WHERE oidc_sub = ?1"),
-        [sub],
-        row_user,
-    )
-    .optional()
-}
-
-pub fn insert_user(
-    c: &Connection,
-    user: &User,
-    oidc_sub: Option<&str>,
-    now: i64,
-) -> rusqlite::Result<()> {
+pub fn insert_user(c: &Connection, user: &User, now: i64) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT INTO users (id, email, name, password_hash, oidc_sub, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO users (id, email, name, password_hash, created_at,
+                            username, onboarded, wpm, theme, guest, accent, lang)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             user.id,
             user.email,
             user.name,
             user.password_hash,
-            oidc_sub,
-            now
+            now,
+            user.username,
+            user.onboarded as i64,
+            user.wpm,
+            user.theme,
+            user.guest as i64,
+            user.accent,
+            user.lang
         ],
     )?;
     Ok(())
@@ -171,7 +256,8 @@ pub fn insert_user(
 /// Persist the mutable profile fields of an already-merged `User`.
 pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE users SET name = ?2, username = ?3, onboarded = ?4, wpm = ?5, theme = ?6
+        "UPDATE users SET name = ?2, username = ?3, onboarded = ?4, wpm = ?5, theme = ?6,
+                          accent = ?7, lang = ?8
          WHERE id = ?1",
         params![
             user.id,
@@ -179,18 +265,105 @@ pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
             user.username,
             user.onboarded as i64,
             user.wpm,
-            user.theme
+            user.theme,
+            user.accent,
+            user.lang
         ],
     )?;
     Ok(())
 }
 
-pub fn link_oidc_sub(c: &Connection, user_id: &str, sub: &str) -> rusqlite::Result<()> {
+// ------------------------------------------------------------ identities
+
+pub fn user_by_identity(
+    c: &Connection,
+    provider: &str,
+    sub: &str,
+) -> rusqlite::Result<Option<User>> {
+    c.query_row(
+        &format!(
+            "SELECT {USER_COLS_U} FROM identities i JOIN users u ON u.id = i.user_id
+             WHERE i.provider = ?1 AND i.sub = ?2"
+        ),
+        params![provider, sub],
+        row_user,
+    )
+    .optional()
+}
+
+pub fn link_identity(
+    c: &Connection,
+    provider: &str,
+    sub: &str,
+    user_id: &str,
+    email: Option<&str>,
+) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE users SET oidc_sub = ?2 WHERE id = ?1",
-        params![user_id, sub],
+        "INSERT OR REPLACE INTO identities (provider, sub, user_id, email)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![provider, sub, user_id, email],
     )?;
     Ok(())
+}
+
+/// Distinct OAuth providers linked to a user (for the lookup `methods` list).
+pub fn identity_providers(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare(
+        "SELECT DISTINCT provider FROM identities WHERE user_id = ?1 ORDER BY provider",
+    )?;
+    let rows = stmt.query_map([user_id], |r| r.get(0))?;
+    rows.collect()
+}
+
+// ------------------------------------------------------------ guest merge
+
+/// Merge a guest account into `target_id`: books, reading days (summing on
+/// day collision) and the session log move over, then the guest row is
+/// deleted (cascading its auth sessions). The intro book never duplicates —
+/// when the target already has one, the guest's copy is dropped. No-op when
+/// `guest_id` is not actually a guest.
+pub fn merge_guest_into(
+    c: &Connection,
+    guest_id: &str,
+    target_id: &str,
+) -> rusqlite::Result<()> {
+    let is_guest: Option<i64> = c
+        .query_row("SELECT guest FROM users WHERE id = ?1", [guest_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if is_guest != Some(1) || guest_id == target_id {
+        return Ok(());
+    }
+    let tx = c.unchecked_transaction()?;
+    let target_intros: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM books WHERE user_id = ?1 AND source = 'intro'",
+        [target_id],
+        |r| r.get(0),
+    )?;
+    if target_intros > 0 {
+        tx.execute(
+            "DELETE FROM books WHERE user_id = ?1 AND source = 'intro'",
+            [guest_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE books SET user_id = ?2 WHERE user_id = ?1",
+        params![guest_id, target_id],
+    )?;
+    tx.execute(
+        "INSERT INTO reading_days (user_id, day, words)
+             SELECT ?2, day, words FROM reading_days WHERE user_id = ?1
+         ON CONFLICT(user_id, day) DO UPDATE SET words = words + excluded.words",
+        params![guest_id, target_id],
+    )?;
+    tx.execute("DELETE FROM reading_days WHERE user_id = ?1", [guest_id])?;
+    tx.execute(
+        "UPDATE sessions_log SET user_id = ?2 WHERE user_id = ?1",
+        params![guest_id, target_id],
+    )?;
+    tx.execute("DELETE FROM users WHERE id = ?1", [guest_id])?;
+    tx.commit()
 }
 
 // ------------------------------------------------------------- sessions
@@ -213,9 +386,11 @@ pub fn create_session(
 
 pub fn session_user(c: &Connection, token: &str, now: i64) -> rusqlite::Result<Option<User>> {
     c.query_row(
-        "SELECT u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, u.wpm, u.theme
-         FROM sessions s JOIN users u ON u.id = s.user_id
-         WHERE s.token = ?1 AND s.expires_at >= ?2",
+        &format!(
+            "SELECT {USER_COLS_U}
+             FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token = ?1 AND s.expires_at >= ?2"
+        ),
         params![token, now],
         row_user,
     )
@@ -224,6 +399,48 @@ pub fn session_user(c: &Connection, token: &str, now: i64) -> rusqlite::Result<O
 
 pub fn delete_session(c: &Connection, token: &str) -> rusqlite::Result<()> {
     c.execute("DELETE FROM sessions WHERE token = ?1", [token])?;
+    Ok(())
+}
+
+// ----------------------------------------------------------- login codes
+
+pub fn upsert_login_code(
+    c: &Connection,
+    email: &str,
+    code_hash: &str,
+    expires_at: i64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO login_codes (email, code_hash, expires_at, attempts)
+         VALUES (?1, ?2, ?3, 0)",
+        params![email, code_hash, expires_at],
+    )?;
+    Ok(())
+}
+
+/// `(code_hash, expires_at, attempts)` for a pending code.
+pub fn login_code(
+    c: &Connection,
+    email: &str,
+) -> rusqlite::Result<Option<(String, i64, i64)>> {
+    c.query_row(
+        "SELECT code_hash, expires_at, attempts FROM login_codes WHERE email = ?1",
+        [email],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+}
+
+pub fn bump_login_code_attempts(c: &Connection, email: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE login_codes SET attempts = attempts + 1 WHERE email = ?1",
+        [email],
+    )?;
+    Ok(())
+}
+
+pub fn delete_login_code(c: &Connection, email: &str) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM login_codes WHERE email = ?1", [email])?;
     Ok(())
 }
 
@@ -237,6 +454,12 @@ pub struct Book {
     pub word_count: i64,
     pub position: i64,
     pub created_at: i64,
+    pub last_read_at: Option<i64>,
+    pub author: Option<String>,
+    pub url: Option<String>,
+    pub favicon: Option<String>,
+    pub excerpt: Option<String>,
+    pub category: Option<String>,
 }
 
 fn row_book(r: &Row) -> rusqlite::Result<Book> {
@@ -247,20 +470,30 @@ fn row_book(r: &Row) -> rusqlite::Result<Book> {
         word_count: r.get(3)?,
         position: r.get(4)?,
         created_at: r.get(5)?,
+        last_read_at: r.get(6)?,
+        author: r.get(7)?,
+        url: r.get(8)?,
+        favicon: r.get(9)?,
+        excerpt: r.get(10)?,
+        category: r.get(11)?,
     })
 }
 
-const BOOK_COLS: &str = "id, title, source, word_count, position, created_at";
+const BOOK_COLS: &str = "id, title, source, word_count, position, created_at, \
+                         last_read_at, author, url, favicon, excerpt, category";
 
 pub fn insert_book(
     c: &Connection,
     user_id: &str,
     book: &Book,
     timeline: &[u8],
+    catalog_slug: Option<&str>,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT INTO books (id, user_id, title, source, word_count, position, timeline, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO books (id, user_id, title, source, word_count, position, timeline,
+                            created_at, last_read_at, author, url, favicon, excerpt,
+                            category, catalog_slug)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             book.id,
             user_id,
@@ -269,7 +502,14 @@ pub fn insert_book(
             book.word_count,
             book.position,
             timeline,
-            book.created_at
+            book.created_at,
+            book.last_read_at,
+            book.author,
+            book.url,
+            book.favicon,
+            book.excerpt,
+            book.category,
+            catalog_slug
         ],
     )?;
     Ok(())
@@ -292,6 +532,28 @@ pub fn get_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Opt
     .optional()
 }
 
+pub fn book_count(c: &Connection, user_id: &str) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM books WHERE user_id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+}
+
+/// Existing library entry for a catalog work (add is idempotent per user).
+pub fn book_id_by_catalog_slug(
+    c: &Connection,
+    user_id: &str,
+    slug: &str,
+) -> rusqlite::Result<Option<String>> {
+    c.query_row(
+        "SELECT id FROM books WHERE user_id = ?1 AND catalog_slug = ?2",
+        params![user_id, slug],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 pub fn get_timeline(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<Vec<u8>>> {
     c.query_row(
         "SELECT timeline FROM books WHERE id = ?1 AND user_id = ?2",
@@ -306,10 +568,11 @@ pub fn set_position(
     user_id: &str,
     id: &str,
     position: i64,
+    now: i64,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE books SET position = ?3 WHERE id = ?1 AND user_id = ?2",
-        params![id, user_id, position],
+        "UPDATE books SET position = ?3, last_read_at = ?4 WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id, position, now],
     )?;
     Ok(())
 }
@@ -321,4 +584,124 @@ pub fn delete_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<
         params![id, user_id],
     )?;
     Ok(n > 0)
+}
+
+// ---------------------------------------------------------- reading days
+
+/// Add consumed words to the user's row for `day` (creating it as needed).
+pub fn add_read_words(
+    c: &Connection,
+    user_id: &str,
+    day: &str,
+    words: i64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO reading_days (user_id, day, words) VALUES (?1, ?2, ?3)
+         ON CONFLICT(user_id, day) DO UPDATE SET words = words + excluded.words",
+        params![user_id, day, words],
+    )?;
+    Ok(())
+}
+
+/// All `(day, words)` rows for a user, oldest first.
+pub fn reading_days(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut stmt =
+        c.prepare("SELECT day, words FROM reading_days WHERE user_id = ?1 ORDER BY day")?;
+    let rows = stmt.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+// ----------------------------------------------------------- session log
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionLog {
+    pub id: String,
+    pub book_id: String,
+    pub started_at: i64,
+    pub duration_ms: i64,
+    pub words: i64,
+    pub avg_wpm: i64,
+}
+
+pub fn insert_session_log(
+    c: &Connection,
+    user_id: &str,
+    s: &SessionLog,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO sessions_log (id, user_id, book_id, started_at, duration_ms, words, avg_wpm)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            s.id, user_id, s.book_id, s.started_at, s.duration_ms, s.words, s.avg_wpm
+        ],
+    )?;
+    Ok(())
+}
+
+/// Newest-first session summaries with the book title when it still exists
+/// (the join is user-scoped so a recycled id can never leak a foreign title).
+pub fn list_sessions_log(
+    c: &Connection,
+    user_id: &str,
+    limit: i64,
+) -> rusqlite::Result<Vec<(SessionLog, Option<String>)>> {
+    let mut stmt = c.prepare(
+        "SELECT s.id, s.book_id, s.started_at, s.duration_ms, s.words, s.avg_wpm, b.title
+         FROM sessions_log s
+         LEFT JOIN books b ON b.id = s.book_id AND b.user_id = s.user_id
+         WHERE s.user_id = ?1
+         ORDER BY s.started_at DESC, s.id
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![user_id, limit], |r| {
+        Ok((
+            SessionLog {
+                id: r.get(0)?,
+                book_id: r.get(1)?,
+                started_at: r.get(2)?,
+                duration_ms: r.get(3)?,
+                words: r.get(4)?,
+                avg_wpm: r.get(5)?,
+            },
+            r.get(6)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+// ---------------------------------------------------------- catalog cache
+
+/// Cached parse of a catalog work, `(timeline_json, word_count)`.
+pub fn catalog_cache_get(
+    c: &Connection,
+    slug: &str,
+) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+    c.query_row(
+        "SELECT timeline, word_count FROM catalog_cache WHERE slug = ?1",
+        [slug],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+pub fn catalog_cache_word_count(c: &Connection, slug: &str) -> rusqlite::Result<Option<i64>> {
+    c.query_row(
+        "SELECT word_count FROM catalog_cache WHERE slug = ?1",
+        [slug],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+pub fn catalog_cache_put(
+    c: &Connection,
+    slug: &str,
+    timeline: &[u8],
+    word_count: i64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO catalog_cache (slug, timeline, word_count) VALUES (?1, ?2, ?3)",
+        params![slug, timeline, word_count],
+    )?;
+    Ok(())
 }

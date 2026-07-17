@@ -1,5 +1,6 @@
-//! Local auth: register/login/logout/me, argon2id password hashing,
-//! `flick_session` cookie sessions, and the `AuthUser` extractor.
+//! Local auth: register/login/logout/me, guest sessions, the email-first
+//! lookup + 6-digit login codes, argon2id password hashing, `flick_session`
+//! cookie sessions, guest-merge on auth success, and the `AuthUser` extractor.
 
 use std::sync::LazyLock;
 
@@ -14,13 +15,17 @@ use axum::Json;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use crate::db::{self, now_secs, User};
+use crate::db::{self, now_secs, Db, User};
 use crate::error::{AppError, AppJson};
 use crate::AppState;
 
 pub const SESSION_COOKIE: &str = "flick_session";
 pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
+
+const LOGIN_CODE_TTL_SECS: i64 = 10 * 60;
+const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
@@ -55,6 +60,18 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn sha256_hex(input: &str) -> String {
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Constant-time equality so code verification can't be timed byte-by-byte.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Extract a cookie value from request headers.
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -87,14 +104,38 @@ pub fn user_json(user: &User) -> Value {
         "email": user.email,
         "name": user.name,
         "username": user.username,
+        "guest": user.guest,
         "onboarded": user.onboarded,
-        "settings": { "wpm": user.wpm, "theme": user.theme },
+        "settings": {
+            "wpm": user.wpm,
+            "theme": user.theme,
+            "accent": user.accent,
+            "lang": user.lang,
+        },
     })
 }
 
-/// Field defaults for a brand-new user (contract: onboarded=false, 350 wpm, auto theme).
-pub fn new_user_defaults() -> (Option<String>, bool, i64, String) {
-    (None, false, 350, "auto".into())
+/// A brand-new user with contract defaults (onboarded=false, 350 wpm, auto
+/// theme, red accent, auto lang).
+pub fn new_user(
+    email: Option<String>,
+    name: String,
+    password_hash: Option<String>,
+    guest: bool,
+) -> User {
+    User {
+        id: random_token(16),
+        email,
+        name,
+        password_hash,
+        username: None,
+        onboarded: false,
+        wpm: 350,
+        theme: "auto".into(),
+        guest,
+        accent: "red".into(),
+        lang: "auto".into(),
+    }
 }
 
 /// Create a session row and return a response carrying the session cookie.
@@ -119,6 +160,33 @@ pub async fn start_session(
             .map_err(AppError::internal)?,
     );
     Ok(resp)
+}
+
+/// Contract: when register/login succeeds (any method, OAuth included) while
+/// the request still carries a valid session of a *guest* user, that guest's
+/// library and stats merge into the target account. Every auth success path
+/// calls this before issuing the new session cookie.
+pub async fn merge_guest_from_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    target_id: &str,
+) -> Result<(), AppError> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+        return Ok(());
+    };
+    let now = now_secs();
+    let target = target_id.to_string();
+    state
+        .db
+        .call(move |c| {
+            if let Some(user) = db::session_user(c, &token, now)? {
+                if user.guest {
+                    db::merge_guest_into(c, &user.id, &target)?;
+                }
+            }
+            Ok(())
+        })
+        .await
 }
 
 // -------------------------------------------------------------- extractor
@@ -147,15 +215,153 @@ impl FromRequestParts<AppState> for AuthUser {
 
 // --------------------------------------------------------------- handlers
 
+/// POST /api/auth/guest — anonymous user row + session (no intro book; that
+/// is seeded alongside the guest's first own add, see books.rs).
+pub async fn guest(State(state): State<AppState>) -> Result<Response, AppError> {
+    let user = new_user(None, "READER".into(), None, true);
+    let now = now_secs();
+    let stored = user.clone();
+    state
+        .db
+        .call(move |c| db::insert_user(c, &stored, now))
+        .await?;
+    start_session(&state, &user.id, StatusCode::CREATED, user_json(&user)).await
+}
+
+#[derive(Deserialize)]
+pub struct LookupBody {
+    email: String,
+}
+
+/// POST /api/auth/lookup — the email-first flow's fork: does the account
+/// exist, and which sign-in methods does it have?
+pub async fn lookup(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<LookupBody>,
+) -> Result<Json<Value>, AppError> {
+    let email = body.email.trim().to_lowercase();
+    let methods = state
+        .db
+        .call(move |c| {
+            let Some(user) = db::user_by_email(c, &email)? else {
+                return Ok(None);
+            };
+            let mut methods = Vec::new();
+            if user.password_hash.is_some() {
+                methods.push("password".to_string());
+            }
+            methods.push("code".to_string()); // email code always works
+            methods.extend(db::identity_providers(c, &user.id)?);
+            Ok(Some(methods))
+        })
+        .await?;
+    Ok(Json(json!({
+        "exists": methods.is_some(),
+        "methods": methods.unwrap_or_default(),
+    })))
+}
+
+/// Generate, store (hashed) and return a fresh 6-digit login code for
+/// `email`. Public so tests can mint a known code — the HTTP handler never
+/// reveals it (SMTP or, in dev mode, the log does). Codes are short-lived
+/// single-use 6-digit secrets, so sha256 is plenty (argon2 unnecessary).
+pub async fn issue_login_code(db: &Db, email: &str) -> Result<String, AppError> {
+    let code = format!("{:06}", rand::rngs::OsRng.next_u32() % 1_000_000);
+    let code_hash = sha256_hex(&code);
+    let expires_at = now_secs() + LOGIN_CODE_TTL_SECS;
+    let email = email.to_string();
+    db.call(move |c| db::upsert_login_code(c, &email, &code_hash, expires_at))
+        .await?;
+    Ok(code)
+}
+
+#[derive(Deserialize)]
+pub struct CodeRequestBody {
+    email: String,
+}
+
+/// POST /api/auth/code/request — always 204 (never reveals whether the
+/// account exists). Existing accounts get a code by mail, or in the server
+/// log when FLICK_SMTP_URL is unset (dev mode).
+pub async fn code_request(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<CodeRequestBody>,
+) -> Result<StatusCode, AppError> {
+    let email = body.email.trim().to_lowercase();
+    let lookup = email.clone();
+    let exists = state
+        .db
+        .call(move |c| db::user_by_email(c, &lookup))
+        .await?
+        .is_some();
+    if exists {
+        let code = issue_login_code(&state.db, &email).await?;
+        if state.config.smtp_url.is_some() {
+            if let Err(e) = crate::mail::send_login_code(&state.config, &email, &code).await {
+                // Still 204: a mail failure must not reveal account existence.
+                tracing::error!("login code mail to {email} failed: {e:?}");
+            }
+        } else {
+            tracing::info!(%email, %code, "login code (dev mode: FLICK_SMTP_URL unset)");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct CodeVerifyBody {
+    email: String,
+    code: String,
+}
+
+/// POST /api/auth/code/verify — single-use, 5 attempts, 10-min expiry.
+/// Unknown email, wrong code and expired code are the same 400.
+pub async fn code_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<CodeVerifyBody>,
+) -> Result<Response, AppError> {
+    let email = body.email.trim().to_lowercase();
+    let presented_hash = sha256_hex(body.code.trim());
+    let now = now_secs();
+    let user = state
+        .db
+        .call(move |c| {
+            let Some((code_hash, expires_at, attempts)) = db::login_code(c, &email)? else {
+                return Ok(None);
+            };
+            if expires_at < now || attempts >= LOGIN_CODE_MAX_ATTEMPTS {
+                db::delete_login_code(c, &email)?;
+                return Ok(None);
+            }
+            db::bump_login_code_attempts(c, &email)?;
+            if !ct_eq(code_hash.as_bytes(), presented_hash.as_bytes()) {
+                if attempts + 1 >= LOGIN_CODE_MAX_ATTEMPTS {
+                    db::delete_login_code(c, &email)?;
+                }
+                return Ok(None);
+            }
+            db::delete_login_code(c, &email)?; // single-use
+            db::user_by_email(c, &email) // codes only log into EXISTING accounts
+        })
+        .await?;
+    let Some(user) = user else {
+        return Err(AppError::bad_request("invalid code"));
+    };
+    merge_guest_from_request(&state, &headers, &user.id).await?;
+    start_session(&state, &user.id, StatusCode::OK, user_json(&user)).await
+}
+
 #[derive(Deserialize)]
 pub struct RegisterBody {
     email: String,
     password: String,
-    name: String,
+    name: Option<String>,
 }
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AppJson(body): AppJson<RegisterBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
@@ -167,37 +373,30 @@ pub async fn register(
             "password must be at least 8 characters",
         ));
     }
-    let name = body.name.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::bad_request("name is required"));
-    }
+    // Contract: name is optional — default to the email's local part.
+    let name = body
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .or_else(|| email.split('@').next().map(str::to_string))
+        .unwrap_or_else(|| "reader".into());
 
     let password = body.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(AppError::internal)??;
 
-    let (username, onboarded, wpm, theme) = new_user_defaults();
-    let user = User {
-        id: random_token(16),
-        email,
-        name,
-        password_hash: Some(password_hash),
-        username,
-        onboarded,
-        wpm,
-        theme,
-    };
+    let user = new_user(Some(email), name, Some(password_hash), false);
     let now = now_secs();
     let inserted = state
         .db
         .call({
             let user = user.clone();
             move |c| {
-                if db::user_by_email(c, &user.email)?.is_some() {
+                if db::user_by_email(c, user.email.as_deref().unwrap_or_default())?.is_some() {
                     return Ok(false);
                 }
-                db::insert_user(c, &user, None, now)?;
+                db::insert_user(c, &user, now)?;
                 crate::books::seed_intro_book(c, &user.id, now)?;
                 Ok(true)
             }
@@ -209,6 +408,7 @@ pub async fn register(
         ));
     }
 
+    merge_guest_from_request(&state, &headers, &user.id).await?;
     start_session(&state, &user.id, StatusCode::CREATED, user_json(&user)).await
 }
 
@@ -220,6 +420,7 @@ pub struct LoginBody {
 
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
@@ -243,6 +444,7 @@ pub async fn login(
 
     match user {
         Some(user) if ok => {
+            merge_guest_from_request(&state, &headers, &user.id).await?;
             start_session(&state, &user.id, StatusCode::OK, user_json(&user)).await
         }
         _ => Err(AppError::Status(
@@ -279,6 +481,8 @@ pub async fn me(AuthUser(user): AuthUser) -> Json<Value> {
 pub struct SettingsPatch {
     wpm: Option<i64>,
     theme: Option<String>,
+    accent: Option<String>,
+    lang: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +536,23 @@ pub async fn update_me(
             }
             user.theme = theme;
         }
+        if let Some(accent) = settings.accent {
+            if !matches!(
+                accent.as_str(),
+                "red" | "ember" | "acid" | "cyan" | "violet" | "mono"
+            ) {
+                return Err(AppError::bad_request(
+                    "accent must be red, ember, acid, cyan, violet, or mono",
+                ));
+            }
+            user.accent = accent;
+        }
+        if let Some(lang) = settings.lang {
+            if !matches!(lang.as_str(), "auto" | "en" | "de") {
+                return Err(AppError::bad_request("lang must be auto, en, or de"));
+            }
+            user.lang = lang;
+        }
     }
 
     let stored = user.clone();
@@ -342,11 +563,17 @@ pub async fn update_me(
     Ok(Json(user_json(&user)).into_response())
 }
 
+/// GET /api/auth/providers — the configured sign-in providers only.
 pub async fn providers(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "oidc": {
-            "enabled": state.config.oidc.is_some(),
-            "name": state.config.oidc_name,
-        }
-    }))
+    let mut providers = Vec::new();
+    if state.config.oidc.is_some() {
+        providers.push(json!({"id": "oidc", "name": state.config.oidc_name}));
+    }
+    if state.config.oauth_google.is_some() {
+        providers.push(json!({"id": "google", "name": "Google"}));
+    }
+    if state.config.oauth_github.is_some() {
+        providers.push(json!({"id": "github", "name": "GitHub"}));
+    }
+    Json(json!({ "providers": providers }))
 }

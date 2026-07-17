@@ -16,6 +16,15 @@ async fn main() {
     if config.oidc.is_some() {
         tracing::info!(name = %config.oidc_name, "OIDC SSO enabled (lazy discovery)");
     }
+    if config.oauth_google.is_some() {
+        tracing::info!("Google sign-in enabled");
+    }
+    if config.oauth_github.is_some() {
+        tracing::info!("GitHub sign-in enabled");
+    }
+    if config.smtp_url.is_none() {
+        tracing::info!("FLICK_SMTP_URL unset — login codes are logged instead of mailed");
+    }
     if config.web_dist.join("index.html").is_file() {
         tracing::info!(dir = %config.web_dist.display(), "serving web client");
     } else {

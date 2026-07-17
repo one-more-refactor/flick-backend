@@ -73,7 +73,7 @@ account across devices. You can delete this book whenever you are done with it.
 Happy flicking.";
 
 /// Seed the built-in intro book for a freshly created user (contract:
-/// every new user starts with one; `source: \"intro\"`).
+/// every new non-guest user starts with one; `source: \"intro\"`).
 pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rusqlite::Result<()> {
     let timeline = Timeline::from_text(INTRO_TEXT);
     let timeline_json = serde_json::to_vec(&timeline).map_err(|e| {
@@ -86,8 +86,28 @@ pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rus
         word_count: timeline.word_count as i64,
         position: 0,
         created_at: now,
+        last_read_at: None,
+        author: None,
+        url: None,
+        favicon: None,
+        excerpt: None,
+        category: None,
     };
-    db::insert_book(c, user_id, &book, &timeline_json)
+    db::insert_book(c, user_id, &book, &timeline_json, None)
+}
+
+/// Guests are not seeded at creation — they get the intro book alongside
+/// their FIRST own add instead, so an empty guest library never exists
+/// (contract). Call before inserting the user's new book.
+pub fn maybe_seed_guest_intro(
+    c: &rusqlite::Connection,
+    user: &db::User,
+    now: i64,
+) -> rusqlite::Result<()> {
+    if user.guest && db::book_count(c, &user.id)? == 0 {
+        seed_intro_book(c, &user.id, now)?;
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------- handlers
@@ -160,11 +180,20 @@ pub async fn create(
         word_count: word_count as i64,
         position: 0,
         created_at: now_secs(),
+        last_read_at: None,
+        author: None,
+        url: None,
+        favicon: None,
+        excerpt: None,
+        category: None,
     };
     let stored = book.clone();
     state
         .db
-        .call(move |c| db::insert_book(c, &user.id, &stored, &timeline_json))
+        .call(move |c| {
+            maybe_seed_guest_intro(c, &user, stored.created_at)?;
+            db::insert_book(c, &user.id, &stored, &timeline_json, None)
+        })
         .await?;
     Ok((StatusCode::CREATED, Json(book)).into_response())
 }
@@ -264,6 +293,11 @@ pub async fn timeline(
 #[derive(Deserialize)]
 pub struct PositionBody {
     position: i64,
+    /// Words consumed since the client's last report (stats, optional).
+    read: Option<i64>,
+    /// The client's LOCAL date `YYYY-MM-DD` (streaks are a human-day
+    /// concept); missing → server UTC date.
+    day: Option<String>,
 }
 
 pub async fn set_position(
@@ -275,12 +309,34 @@ pub async fn set_position(
     if body.position < 0 {
         return Err(AppError::bad_request("position must be >= 0"));
     }
+    let day = match body.day {
+        Some(day) => {
+            let Some(epoch_days) = crate::stats::parse_day(&day) else {
+                return Err(AppError::bad_request("day must be a valid YYYY-MM-DD date"));
+            };
+            // Clock-abuse guard: reject days too far from the server date.
+            if (epoch_days - crate::stats::today_epoch_days()).abs()
+                > crate::stats::MAX_DAY_SKEW_DAYS
+            {
+                return Err(AppError::bad_request(
+                    "day is too far from the server date",
+                ));
+            }
+            day
+        }
+        None => crate::stats::utc_day(0),
+    };
+    let read = body
+        .read
+        .unwrap_or(0)
+        .clamp(0, crate::stats::MAX_READ_PER_REPORT);
     enum Outcome {
         Missing,
         OutOfRange,
         Updated,
     }
     let position = body.position;
+    let now = now_secs();
     let outcome = state
         .db
         .call(move |c| {
@@ -290,7 +346,10 @@ pub async fn set_position(
             if position > book.word_count {
                 return Ok(Outcome::OutOfRange);
             }
-            db::set_position(c, &user.id, &id, position)?;
+            db::set_position(c, &user.id, &id, position, now)?;
+            if read > 0 {
+                db::add_read_words(c, &user.id, &day, read)?;
+            }
             Ok(Outcome::Updated)
         })
         .await?;
