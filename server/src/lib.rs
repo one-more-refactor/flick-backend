@@ -9,6 +9,8 @@ pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod import;
+pub mod integrations;
 pub mod mail;
 pub mod oidc;
 pub mod stats;
@@ -106,12 +108,16 @@ fn api_router() -> Router<AppState> {
         .route("/auth/oidc/login", get(oidc::oidc_login_alias))
         .route("/auth/oidc/callback", get(oidc::oidc_callback_alias))
         .route("/books", get(books::list).post(books::create))
+        .route("/import/url", post(books::import_url))
+        .route("/import/html", post(books::import_html))
         .route(
             "/books/{id}",
             get(books::get_book).delete(books::delete_book),
         )
         .route("/books/{id}/timeline", get(books::timeline))
+        .route("/books/{id}/text", get(books::text))
         .route("/books/{id}/position", put(books::set_position))
+        .route("/integrations", get(integrations::integrations))
         .route("/stats", get(stats::stats))
         .route(
             "/sessions",

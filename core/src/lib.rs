@@ -34,18 +34,36 @@ impl Timeline {
     }
 }
 
+/// Split text into trimmed, non-empty paragraphs (blank-line separated). The
+/// single source of truth for paragraph boundaries, shared by the timeline
+/// tokenizer and [`paragraphs`] so their word sequences line up exactly.
+fn split_paragraphs(text: &str) -> Vec<&str> {
+    text.split("\n\n")
+        .flat_map(|p| p.split("\r\n\r\n"))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Word tokens grouped by paragraph, in reading order. Flattening the result
+/// yields exactly the `text` fields of `Timeline::from_text(text).words`, in
+/// the same order and count — both split paragraphs and words identically —
+/// so clients can map the full-text view onto timeline indices 1:1
+/// (CONTRACTS.md `GET /api/books/:id/text`).
+pub fn paragraphs(text: &str) -> Vec<Vec<String>> {
+    split_paragraphs(text)
+        .iter()
+        .map(|para| para.split_whitespace().map(str::to_string).collect())
+        .collect()
+}
+
 /// Split text into timeline words, paragraph-aware.
 ///
 /// A paragraph break is one or more blank lines; the word preceding it gets
 /// the paragraph dwell weight instead of the sentence weight.
 fn tokenize(text: &str) -> Vec<TimelineWord> {
     let mut out = Vec::new();
-    let paragraphs: Vec<&str> = text
-        .split("\n\n")
-        .flat_map(|p| p.split("\r\n\r\n"))
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
+    let paragraphs = split_paragraphs(text);
 
     for (pi, para) in paragraphs.iter().enumerate() {
         let tokens: Vec<&str> = para.split_whitespace().collect();
@@ -168,6 +186,24 @@ mod tests {
     fn handles_empty_and_whitespace() {
         assert_eq!(Timeline::from_text("").word_count, 0);
         assert_eq!(Timeline::from_text("  \n\n  \n").word_count, 0);
+    }
+
+    #[test]
+    fn paragraphs_flatten_to_timeline_words() {
+        let text = "One two three.\n\nFour five.\r\n\r\nSix.";
+        let paras = paragraphs(text);
+        assert_eq!(
+            paras,
+            vec![
+                vec!["One", "two", "three."],
+                vec!["Four", "five."],
+                vec!["Six."],
+            ]
+        );
+        let flat: Vec<String> = paras.into_iter().flatten().collect();
+        let tl_words: Vec<String> =
+            Timeline::from_text(text).words.iter().map(|w| w.0.clone()).collect();
+        assert_eq!(flat, tl_words);
     }
 
     #[test]

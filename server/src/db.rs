@@ -117,6 +117,35 @@ CREATE TABLE catalog_cache (
 );
 ";
 
+/// v0.3b: store each book's source plaintext (needed for `/text` and search)
+/// and index title/author/text with an external-content FTS5 table kept in
+/// sync by triggers. Pre-existing books get `text = NULL` (still readable,
+/// just not searchable / no `/text`, per contract). The FTS index is
+/// backfilled from current rows before the triggers take over future writes.
+const SCHEMA_V4: &str = "
+ALTER TABLE books ADD COLUMN text TEXT;
+CREATE VIRTUAL TABLE books_fts USING fts5(
+    title, author, text,
+    content='books', content_rowid='rowid'
+);
+INSERT INTO books_fts (rowid, title, author, text)
+    SELECT rowid, title, author, text FROM books;
+CREATE TRIGGER books_fts_ai AFTER INSERT ON books BEGIN
+    INSERT INTO books_fts (rowid, title, author, text)
+    VALUES (new.rowid, new.title, new.author, new.text);
+END;
+CREATE TRIGGER books_fts_ad AFTER DELETE ON books BEGIN
+    INSERT INTO books_fts (books_fts, rowid, title, author, text)
+    VALUES ('delete', old.rowid, old.title, old.author, old.text);
+END;
+CREATE TRIGGER books_fts_au AFTER UPDATE ON books BEGIN
+    INSERT INTO books_fts (books_fts, rowid, title, author, text)
+    VALUES ('delete', old.rowid, old.title, old.author, old.text);
+    INSERT INTO books_fts (rowid, title, author, text)
+    VALUES (new.rowid, new.title, new.author, new.text);
+END;
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -152,6 +181,11 @@ impl Db {
             conn.pragma_update(None, "foreign_keys", "ON")?;
             migrated?;
             conn.pragma_update(None, "user_version", 3)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 4 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V4}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 4)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -487,13 +521,14 @@ pub fn insert_book(
     user_id: &str,
     book: &Book,
     timeline: &[u8],
+    text: Option<&str>,
     catalog_slug: Option<&str>,
 ) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO books (id, user_id, title, source, word_count, position, timeline,
                             created_at, last_read_at, author, url, favicon, excerpt,
-                            category, catalog_slug)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                            category, catalog_slug, text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             book.id,
             user_id,
@@ -509,10 +544,45 @@ pub fn insert_book(
             book.favicon,
             book.excerpt,
             book.category,
-            catalog_slug
+            catalog_slug,
+            text
         ],
     )?;
     Ok(())
+}
+
+/// The stored source plaintext for a user's book, or `None` when the book is
+/// missing or predates text storage (v0.3b backfilled such rows as NULL).
+pub fn book_text(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row(
+        "SELECT text FROM books WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+}
+
+/// Full-text search a user's books (title + author + text) via FTS5, ordered
+/// by relevance. `match_query` must already be a safe FTS5 query string.
+pub fn search_books(
+    c: &Connection,
+    user_id: &str,
+    match_query: &str,
+) -> rusqlite::Result<Vec<Book>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {} FROM books_fts
+         JOIN books b ON b.rowid = books_fts.rowid
+         WHERE books_fts MATCH ?1 AND b.user_id = ?2
+         ORDER BY books_fts.rank",
+        BOOK_COLS
+            .split(", ")
+            .map(|c| format!("b.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    let rows = stmt.query_map(params![match_query, user_id], row_book)?;
+    rows.collect()
 }
 
 pub fn list_books(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<Book>> {

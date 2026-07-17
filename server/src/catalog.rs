@@ -182,7 +182,15 @@ pub async fn add(
                 excerpt: None,
                 category: category_for(&entry.kind).map(str::to_string),
             };
-            db::insert_book(c, &user.id, &book, &timeline_json, Some(&entry.slug))?;
+            // Store the raw catalog text so /text + search work on it too.
+            db::insert_book(
+                c,
+                &user.id,
+                &book,
+                &timeline_json,
+                Some(text_for(&entry.file)),
+                Some(&entry.slug),
+            )?;
             Ok(Outcome::Created(Box::new(book)))
         })
         .await?;

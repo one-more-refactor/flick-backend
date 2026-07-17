@@ -9,7 +9,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use flick_server::config::Config;
+use flick_server::config::{Config, OAuthCreds};
 use flick_server::db::Db;
 use flick_server::{app, AppState};
 
@@ -39,6 +39,30 @@ fn test_app() -> (Router, tempfile::TempDir) {
     (app, dir)
 }
 
+/// A test app whose `Config` is customized (used for the integrations
+/// endpoint, which reflects configured keys).
+fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = Config {
+        addr: "127.0.0.1:0".into(),
+        data_dir: dir.path().join("data"),
+        public_url: "http://localhost:8484".into(),
+        web_dist: dir.path().join("no-such-dist"),
+        oidc: None,
+        oidc_name: "SSO".into(),
+        oauth_google: None,
+        oauth_github: None,
+        smtp_url: None,
+        smtp_from: "flick <no-reply@localhost>".into(),
+        dropbox_app_key: None,
+        google_picker_api_key: None,
+    };
+    mutate(&mut config);
+    let db = Db::open(&config.data_dir).expect("open db");
+    let state = AppState::new(db, config);
+    (app(state), dir)
+}
+
 async fn send(app: &Router, req: Request<Body>) -> Response {
     app.clone().oneshot(req).await.expect("infallible")
 }
@@ -60,6 +84,33 @@ fn bare_request(method: &str, uri: &str, cookie: Option<&str>) -> Request<Body> 
         builder = builder.header(header::COOKIE, c);
     }
     builder.body(Body::empty()).expect("request")
+}
+
+/// A `POST /api/books` multipart upload of `bytes` as `file` (filename only,
+/// no explicit Content-Type field — the server sniffs the bytes).
+fn upload_request(cookie: &str, filename: &str, bytes: &[u8]) -> Request<Body> {
+    let boundary = "XFLICKBOUNDARY";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    Request::builder()
+        .method("POST")
+        .uri("/api/books")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header(header::COOKIE, cookie)
+        .body(Body::from(body))
+        .expect("request")
 }
 
 /// Extract `flick_session=...` from Set-Cookie for reuse as a Cookie header.
@@ -402,31 +453,31 @@ async fn foreign_books_are_404() {
 }
 
 #[tokio::test]
-async fn non_pdf_upload_rejected() {
+async fn txt_upload_accepted_and_binary_rejected() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "upload@example.com").await;
 
-    let boundary = "XFLICKBOUNDARY";
-    let body = format!(
-        "--{boundary}\r\n\
-         Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\n\
-         Content-Type: text/plain\r\n\r\n\
-         just some text\r\n\
-         --{boundary}--\r\n"
-    );
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/books")
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .header(header::COOKIE, &cookie)
-        .body(Body::from(body))
-        .expect("request");
-    let resp = send(&app, req).await;
+    // A plain-text upload is now a first-class import (source "txt"); the
+    // filename supplies the title when no title field is present.
+    let resp = send(
+        &app,
+        upload_request(&cookie, "notes.txt", b"Just some plain text to read here."),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "txt");
+    assert_eq!(book["title"], "notes");
+    assert_eq!(book["category"], "docs");
+
+    // Non-UTF-8 binary that is neither PDF nor EPUB is rejected.
+    let resp = send(
+        &app,
+        upload_request(&cookie, "blob.bin", &[0x00, 0xFF, 0xFE, 0x01, 0x02, 0x80]),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(resp).await["error"], "only PDF uploads are supported");
+    assert!(body_json(resp).await["error"].is_string());
 }
 
 // ------------------------------------------------------------ misc routes
@@ -1041,4 +1092,256 @@ async fn catalog_list_add_and_duplicate() {
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     assert_eq!(body_json(resp).await["category"], "book");
+}
+
+// ------------------------------------------------- v0.3b: imports & search
+
+#[tokio::test]
+async fn epub_upload_extracts_text_and_metadata() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "epub@example.com").await;
+
+    let bytes = include_bytes!("fixtures/minimal.epub");
+    let resp = send(&app, upload_request(&cookie, "book.epub", bytes)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "epub upload should succeed");
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "epub");
+    assert_eq!(book["category"], "book");
+    assert_eq!(book["title"], "The Test EPUB"); // from EPUB metadata
+    assert_eq!(book["author"], "Jane Author");
+    assert!(book["word_count"].as_i64().expect("count") > 0);
+
+    // The spine text made it in: search finds a chapter body word.
+    let id = book["id"].as_str().expect("id").to_string();
+    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let flat: Vec<String> = text["paragraphs"]
+        .as_array()
+        .expect("paragraphs")
+        .iter()
+        .flat_map(|p| p.as_array().expect("para").iter().map(|w| w.as_str().expect("word").to_string()))
+        .collect();
+    assert!(flat.iter().any(|w| w.contains("harbor")), "expected 'harbor' in {flat:?}");
+    assert!(flat.iter().any(|w| w.contains("letter")), "expected ch2 text too");
+}
+
+#[tokio::test]
+async fn clippings_upload_multi_book() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "clip@example.com").await;
+
+    let clippings = "\
+The Pragmatic Programmer (Hunt, Andrew)
+- Your Highlight on page 12 | Location 145-146 | Added on Monday
+
+Care about your craft.
+==========
+Meditations (Marcus Aurelius)
+- Your Highlight on Location 55-56 | Added on Tuesday
+
+Waste no more time arguing about what a good man should be. Be one.
+==========
+The Pragmatic Programmer (Hunt, Andrew)
+- Your Highlight on page 40 | Location 500-501 | Added on Wednesday
+
+Don't live with broken windows.
+==========
+";
+    let resp = send(&app, upload_request(&cookie, "My Clippings.txt", clippings.as_bytes())).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "clippings");
+    assert_eq!(book["category"], "docs");
+    // Spans multiple books → generic title, each highlight prefixed by book.
+    assert_eq!(book["title"], "Kindle Clippings");
+    let id = book["id"].as_str().expect("id").to_string();
+
+    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let paras = text["paragraphs"].as_array().expect("paragraphs");
+    assert_eq!(paras.len(), 3, "one paragraph per highlight");
+    // First paragraph starts with its source-book prefix.
+    let first_word = paras[0][0].as_str().expect("word");
+    assert!(first_word.starts_with("The") , "expected book-title prefix, got {first_word:?}");
+}
+
+#[tokio::test]
+async fn import_html_extracts_article() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "html@example.com").await;
+
+    let html = "\
+<!DOCTYPE html><html><head><title>Reading Faster — The Blog</title>
+<link rel=\"icon\" href=\"/icon.png\"></head>
+<body><nav>Home About Contact</nav>
+<article>
+<h1>How Speed Reading Works</h1>
+<p class=\"byline\">By Jane Reader</p>
+<p>Speed reading is the practice of recognizing and absorbing phrases or sentences on a page all at once, rather than identifying individual words. Skilled readers train their eyes to move efficiently across the text.</p>
+<p>The optimal recognition point is the spot within a word where the eye most naturally lands. By fixing attention there, a reader can process each word with far less effort and much greater speed than before.</p>
+<p>With consistent practice over several weeks, most people can comfortably double their original reading pace while keeping strong comprehension of the material they consume every day.</p>
+</article>
+<footer>Copyright 2026</footer></body></html>";
+
+    let resp = send(
+        &app,
+        json_request("POST", "/api/import/html", Some(&cookie), json!({
+            "url": "https://blog.example.com/speed-reading",
+            "html": html,
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "readability import should succeed");
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "html");
+    assert_eq!(book["category"], "article");
+    assert_eq!(book["url"], "https://blog.example.com/speed-reading");
+    // Favicon falls back to the origin when we cannot glean one.
+    assert!(book["favicon"].as_str().expect("favicon").starts_with("https://blog.example.com"));
+    assert!(!book["excerpt"].as_str().expect("excerpt").is_empty());
+    assert!(book["word_count"].as_i64().expect("count") > 20);
+
+    // The article body is searchable and the nav/footer chrome was dropped.
+    let resp = send(&app, bare_request("GET", "/api/books?q=recognition", Some(&cookie))).await;
+    let hits = body_json(resp).await;
+    assert!(hits.as_array().expect("array").iter().any(|b| b["source"] == "html"));
+}
+
+#[tokio::test]
+async fn import_url_rejects_private_and_local_addresses() {
+    // The SSRF guard must reject non-public targets WITHOUT fetching. We test
+    // the guard directly (no network) plus the endpoint's 400.
+    for url in [
+        "http://127.0.0.1/secret",
+        "http://localhost:8484/api/stats",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "http://[::1]/",
+        "ftp://example.com/file",
+    ] {
+        let err = flick_server::import::guarded_fetch(url).await;
+        assert!(err.is_err(), "guard should reject {url}");
+    }
+
+    // Public unicast passes the IP check; private/reserved fail it.
+    use std::net::IpAddr;
+    for ip in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
+        assert!(flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should be global");
+    }
+    for ip in ["127.0.0.1", "10.0.0.1", "192.168.0.1", "169.254.0.1", "172.16.0.1", "100.64.0.1", "::1", "fe80::1", "fc00::1", "0.0.0.0"] {
+        assert!(!flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should NOT be global");
+    }
+
+    // The endpoint surfaces the guard as a 400 (no outbound request made).
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "ssrf@example.com").await;
+    let resp = send(
+        &app,
+        json_request("POST", "/api/import/url", Some(&cookie), json!({"url": "http://127.0.0.1/admin"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"].is_string());
+}
+
+#[tokio::test]
+async fn text_paragraphs_flatten_to_timeline() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "text@example.com").await;
+
+    let book = create_paste_book(
+        &app,
+        &cookie,
+        Some("Flatten"),
+        "First sentence here.\n\nSecond paragraph, longer, with more words to read.\n\nThird.",
+    )
+    .await;
+    let id = book["id"].as_str().expect("id").to_string();
+
+    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let flat: Vec<String> = text["paragraphs"]
+        .as_array()
+        .expect("paragraphs")
+        .iter()
+        .flat_map(|p| p.as_array().expect("para").iter().map(|w| w.as_str().expect("word").to_string()))
+        .collect();
+
+    let timeline = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/timeline"), Some(&cookie))).await).await;
+    let tl_words: Vec<String> = timeline["words"]
+        .as_array()
+        .expect("words")
+        .iter()
+        .map(|w| w[0].as_str().expect("text").to_string())
+        .collect();
+
+    assert_eq!(flat, tl_words, "flattened text must equal the timeline word order");
+    assert_eq!(flat.len() as i64, book["word_count"].as_i64().expect("count"));
+}
+
+#[tokio::test]
+async fn search_scopes_to_user_and_matches_title_and_body() {
+    let (app, _dir) = test_app();
+    let alice = register(&app, "searcha@example.com").await;
+    let bob = register(&app, "searchb@example.com").await;
+
+    create_paste_book(&app, &alice, Some("Astronomy Notes"), "The telescope revealed distant nebulae.").await;
+    create_paste_book(&app, &alice, Some("Cooking"), "A recipe for sourdough bread.").await;
+    create_paste_book(&app, &bob, Some("Astronomy Secrets"), "Bob's private telescope notes.").await;
+
+    // Match by title word.
+    let resp = send(&app, bare_request("GET", "/api/books?q=astronomy", Some(&alice))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hits = body_json(resp).await;
+    let hits = hits.as_array().expect("array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["title"], "Astronomy Notes");
+
+    // Match by body word, still scoped to Alice (Bob's telescope book excluded).
+    let resp = send(&app, bare_request("GET", "/api/books?q=telescope", Some(&alice))).await;
+    let hits = body_json(resp).await;
+    let hits = hits.as_array().expect("array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["title"], "Astronomy Notes");
+
+    // No q → the whole library (Astronomy + Cooking + seeded intro).
+    let resp = send(&app, bare_request("GET", "/api/books", Some(&alice))).await;
+    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(3));
+
+    // A no-op / punctuation-only query returns an empty list, never a 500.
+    let resp = send(&app, bare_request("GET", "/api/books?q=%20%2A%2A%2A", Some(&alice))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn integrations_null_and_configured() {
+    // Unconfigured: both integrations are null.
+    let (app, _dir) = test_app();
+    let resp = send(&app, bare_request("GET", "/api/integrations", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK); // public, no auth
+    let body = body_json(resp).await;
+    assert_eq!(body, json!({"dropbox": Value::Null, "google_picker": Value::Null}));
+
+    // Dropbox key alone lights up Dropbox; Google needs BOTH client id + api key.
+    let (app, _dir) = test_app_with_config(|c| {
+        c.dropbox_app_key = Some("dbx-key-123".into());
+        c.oauth_google = Some(OAuthCreds {
+            client_id: "goog-client".into(),
+            client_secret: "goog-secret".into(),
+        });
+        c.google_picker_api_key = Some("picker-api-key".into());
+    });
+    let body = body_json(send(&app, bare_request("GET", "/api/integrations", None)).await).await;
+    assert_eq!(body["dropbox"], json!({"app_key": "dbx-key-123"}));
+    assert_eq!(body["google_picker"], json!({"client_id": "goog-client", "api_key": "picker-api-key"}));
+
+    // Google client id present but no picker api key → google_picker stays null.
+    let (app, _dir) = test_app_with_config(|c| {
+        c.oauth_google = Some(OAuthCreds {
+            client_id: "goog-client".into(),
+            client_secret: "goog-secret".into(),
+        });
+    });
+    let body = body_json(send(&app, bare_request("GET", "/api/integrations", None)).await).await;
+    assert_eq!(body["google_picker"], Value::Null);
+    assert_eq!(body["dropbox"], Value::Null);
 }

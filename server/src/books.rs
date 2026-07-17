@@ -1,16 +1,18 @@
 //! Books: paste/PDF ingestion via flick-core, timelines, reading position.
 
 use axum::extract::multipart::MultipartError;
-use axum::extract::{FromRequest, Multipart, Request, State};
+use axum::extract::{FromRequest, Multipart, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use flick_core::Timeline;
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::auth::{random_token, AuthUser};
 use crate::db::{self, now_secs, Book};
 use crate::error::{AppError, AppJson, AppPath};
+use crate::import::{self, Prepared};
 use crate::AppState;
 
 /// Upload/body cap (CONTRACTS.md: 25 MB).
@@ -93,7 +95,7 @@ pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rus
         excerpt: None,
         category: None,
     };
-    db::insert_book(c, user_id, &book, &timeline_json, None)
+    db::insert_book(c, user_id, &book, &timeline_json, Some(INTRO_TEXT), None)
 }
 
 /// Guests are not seeded at creation — they get the intro book alongside
@@ -112,14 +114,55 @@ pub fn maybe_seed_guest_intro(
 
 // --------------------------------------------------------------- handlers
 
+#[derive(Deserialize)]
+pub struct ListQuery {
+    q: Option<String>,
+}
+
+/// Build a safe FTS5 MATCH query from user input: each whitespace-run becomes a
+/// quoted term (alphanumerics + apostrophes only, so no FTS operator can leak
+/// in), ANDed together. `None` when nothing searchable remains — the caller
+/// then returns an empty list rather than a 500 (CONTRACTS.md: FTS syntax
+/// errors must not surface as 500s).
+fn fts_query(q: &str) -> Option<String> {
+    let terms: Vec<String> = q
+        .split_whitespace()
+        .map(|t| {
+            t.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'')
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+/// GET /api/books — the whole library, or an FTS5 search when `?q=` is given.
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<Book>>, AppError> {
-    let books = state
-        .db
-        .call(move |c| db::list_books(c, &user.id))
-        .await?;
+    let books = match query.q {
+        Some(q) if !q.trim().is_empty() => {
+            let Some(match_query) = fts_query(&q) else {
+                return Ok(Json(Vec::new()));
+            };
+            state
+                .db
+                .call(move |c| db::search_books(c, &user.id, &match_query))
+                .await
+                // A malformed MATCH is the client's problem, never a 500.
+                .map_err(|_| AppError::bad_request("invalid search query"))?
+        }
+        _ => {
+            state
+                .db
+                .call(move |c| db::list_books(c, &user.id))
+                .await?
+        }
+    };
     Ok(Json(books))
 }
 
@@ -133,37 +176,36 @@ fn multipart_err(e: MultipartError) -> AppError {
     AppError::Status(e.status(), e.body_text())
 }
 
-/// POST /api/books — JSON `{title?, text}` or multipart PDF (`file`, `title?`).
-pub async fn create(
-    State(state): State<AppState>,
-    AuthUser(user): AuthUser,
-    req: Request,
+/// Tokenize a `Prepared` book through flick-core (off the async runtime),
+/// persist it (with its plaintext, for `/text` + search), and return `201`.
+/// Shared by paste, uploads and both web-import paths. `title_fallback` fills
+/// in a title when the parser found none (e.g. paste/pdf → first ~40 chars).
+async fn insert_prepared(
+    state: &AppState,
+    user: &crate::db::User,
+    prepared: Prepared,
 ) -> Result<Response, AppError> {
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let Prepared {
+        title,
+        text,
+        source,
+        author,
+        url,
+        favicon,
+        excerpt,
+        category,
+    } = prepared;
 
-    let (title, text, source) = if content_type.starts_with("multipart/form-data") {
-        let (title, text) = from_pdf_upload(&state, req).await?;
-        (title, text, "pdf")
-    } else {
-        let AppJson(body) = AppJson::<PasteBody>::from_request(req, &state).await?;
-        let text = body.text;
-        if text.trim().is_empty() {
-            return Err(AppError::bad_request("text must not be empty"));
-        }
-        let title = clean_title(body.title).unwrap_or_else(|| default_title(&text));
-        (title, text, "paste")
-    };
+    if text.trim().is_empty() {
+        return Err(AppError::bad_request("no readable text was found"));
+    }
+    let title = clean_title(title).unwrap_or_else(|| default_title(&text));
 
     // Timeline construction can chew through megabytes of text; keep it off
-    // the async runtime. flick-core is the only parser.
-    let (timeline_json, word_count) = tokio::task::spawn_blocking(move || {
+    // the async runtime. flick-core is the only tokenizer.
+    let (timeline_json, word_count, text) = tokio::task::spawn_blocking(move || {
         let timeline = Timeline::from_text(&text);
-        serde_json::to_vec(&timeline).map(|json| (json, timeline.word_count))
+        serde_json::to_vec(&timeline).map(|json| (json, timeline.word_count, text))
     })
     .await
     .map_err(AppError::internal)?
@@ -181,28 +223,62 @@ pub async fn create(
         position: 0,
         created_at: now_secs(),
         last_read_at: None,
-        author: None,
-        url: None,
-        favicon: None,
-        excerpt: None,
-        category: None,
+        author,
+        url,
+        favicon,
+        excerpt,
+        category,
     };
     let stored = book.clone();
+    let user = user.clone();
     state
         .db
         .call(move |c| {
             maybe_seed_guest_intro(c, &user, stored.created_at)?;
-            db::insert_book(c, &user.id, &stored, &timeline_json, None)
+            db::insert_book(c, &user.id, &stored, &timeline_json, Some(&text), None)
         })
         .await?;
     Ok((StatusCode::CREATED, Json(book)).into_response())
 }
 
-/// Pull `title` + `file` out of the multipart body and extract PDF text.
-async fn from_pdf_upload(
-    state: &AppState,
+/// POST /api/books — JSON `{title?, text}` or a multipart `file` upload sniffed
+/// by its bytes (PDF / EPUB / Kindle clippings / plain text; CONTRACTS.md).
+pub async fn create(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
     req: Request,
-) -> Result<(String, String), AppError> {
+) -> Result<Response, AppError> {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let prepared = if content_type.starts_with("multipart/form-data") {
+        from_upload(&state, req).await?
+    } else {
+        let AppJson(body) = AppJson::<PasteBody>::from_request(req, &state).await?;
+        if body.text.trim().is_empty() {
+            return Err(AppError::bad_request("text must not be empty"));
+        }
+        Prepared {
+            title: clean_title(body.title),
+            text: body.text,
+            source: "paste",
+            author: None,
+            url: None,
+            favicon: None,
+            excerpt: None,
+            category: None,
+        }
+    };
+
+    insert_prepared(&state, &user, prepared).await
+}
+
+/// Pull `title` + `file` out of the multipart body and route by content sniff.
+async fn from_upload(state: &AppState, req: Request) -> Result<Prepared, AppError> {
     let mut multipart = Multipart::from_request(req, state)
         .await
         .map_err(|e| AppError::Status(e.status(), e.body_text()))?;
@@ -224,40 +300,170 @@ async fn from_pdf_upload(
         }
     }
     let file = file.ok_or_else(|| AppError::bad_request("missing multipart field \"file\""))?;
-    if !file.starts_with(b"%PDF") {
-        return Err(AppError::bad_request("only PDF uploads are supported"));
-    }
+    let title = clean_title(title);
+    sniff_bytes(file, title, filename.as_deref()).await
+}
 
-    // pdf-extract is known to panic on malformed PDFs: catch_unwind + map
-    // anything that goes wrong to a 400.
+/// Route uploaded bytes to the right parser (bytes decide, not the extension).
+/// The web-import fetch path reuses this for pdf/epub/plain content.
+async fn sniff_bytes(
+    bytes: Vec<u8>,
+    title: Option<String>,
+    filename: Option<&str>,
+) -> Result<Prepared, AppError> {
+    if import::looks_like_pdf(&bytes) {
+        return from_pdf(bytes, title, filename).await;
+    }
+    if import::looks_like_epub(&bytes) {
+        let mut prepared = import::extract_epub(bytes).await?;
+        // An explicit upload title wins over EPUB metadata.
+        if title.is_some() {
+            prepared.title = title;
+        }
+        return Ok(prepared);
+    }
+    // Text formats require valid UTF-8.
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Err(AppError::bad_request(
+            "unsupported file type (expected PDF, EPUB, or UTF-8 text)",
+        ));
+    };
+    if let Some(mut prepared) = import::parse_clippings(&text) {
+        if title.is_some() {
+            prepared.title = title;
+        }
+        return Ok(prepared);
+    }
+    if text.trim().is_empty() {
+        return Err(AppError::bad_request("the file has no readable text"));
+    }
+    let title = title.or_else(|| {
+        filename
+            .map(|f| {
+                f.trim_end_matches(".txt")
+                    .trim_end_matches(".md")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|f| !f.is_empty())
+    });
+    Ok(Prepared {
+        title,
+        text,
+        source: "txt",
+        author: None,
+        url: None,
+        favicon: None,
+        excerpt: None,
+        category: Some("docs".into()),
+    })
+}
+
+/// PDF text extraction, panic-guarded like the other parsers.
+async fn from_pdf(
+    file: Vec<u8>,
+    title: Option<String>,
+    filename: Option<&str>,
+) -> Result<Prepared, AppError> {
     let extracted = tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&file))
     })
     .await
     .map_err(AppError::internal)?;
     let text = match extracted {
-        Ok(Ok(text)) => text,
+        Ok(Ok(text)) if !text.trim().is_empty() => text,
         _ => {
             return Err(AppError::bad_request(
                 "could not extract text from this PDF",
             ))
         }
     };
-    if text.trim().is_empty() {
-        return Err(AppError::bad_request(
-            "could not extract text from this PDF",
-        ));
-    }
+    let title = title.or_else(|| {
+        filename
+            .map(|f| f.trim_end_matches(".pdf").trim().to_string())
+            .filter(|f| !f.is_empty())
+    });
+    Ok(Prepared {
+        title,
+        text,
+        source: "pdf",
+        author: None,
+        url: None,
+        favicon: None,
+        excerpt: None,
+        category: Some("docs".into()),
+    })
+}
 
-    let title = clean_title(title)
-        .or_else(|| {
-            filename
-                .as_deref()
-                .map(|f| f.trim_end_matches(".pdf").trim().to_string())
-                .filter(|f| !f.is_empty())
-        })
-        .unwrap_or_else(|| default_title(&text));
-    Ok((title, text))
+#[derive(Deserialize)]
+pub struct ImportUrlBody {
+    url: String,
+    title: Option<String>,
+}
+
+/// POST /api/import/url — server fetches the page (SSRF-guarded) and imports
+/// it: pdf/epub/plain bytes go through the upload parsers, HTML through
+/// readability (CONTRACTS.md).
+pub async fn import_url(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppJson(body): AppJson<ImportUrlBody>,
+) -> Result<Response, AppError> {
+    let title = clean_title(body.title);
+    let (final_url, bytes, content_type) = import::guarded_fetch(body.url.trim()).await?;
+
+    let prepared = if import::looks_like_pdf(&bytes)
+        || import::looks_like_epub(&bytes)
+        || !import::looks_like_html(&content_type, &bytes)
+    {
+        // A concrete file (or plain text) behind the link — the Dropbox /
+        // Google Picker direct-download path. Sniff it like an upload, then
+        // re-tag it as a URL import and attach web metadata.
+        let mut prepared = sniff_bytes(bytes, title, None).await?;
+        prepared.source = "url";
+        prepared.url = Some(final_url.clone());
+        prepared.favicon = import::origin_favicon(&final_url);
+        prepared
+    } else {
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        let mut prepared = import::extract_article(html, final_url, "url").await?;
+        if title.is_some() {
+            prepared.title = title;
+        }
+        prepared
+    };
+
+    insert_prepared(&state, &user, prepared).await
+}
+
+#[derive(Deserialize)]
+pub struct ImportHtmlBody {
+    url: String,
+    html: String,
+    title: Option<String>,
+}
+
+/// POST /api/import/html — the extension path: readability runs on HTML the
+/// client already captured (no server fetch, so no SSRF concern), for
+/// paywalled/logged-in pages the user can see (CONTRACTS.md).
+pub async fn import_html(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppJson(body): AppJson<ImportHtmlBody>,
+) -> Result<Response, AppError> {
+    if body.html.len() > import::IMPORT_LIMIT {
+        return Err(AppError::bad_request("html exceeds the 25 MB limit"));
+    }
+    let url = body.url.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::bad_request("url must not be empty"));
+    }
+    let title = clean_title(body.title);
+    let mut prepared = import::extract_article(body.html, url, "html").await?;
+    if title.is_some() {
+        prepared.title = title;
+    }
+    insert_prepared(&state, &user, prepared).await
 }
 
 pub async fn get_book(
@@ -288,6 +494,24 @@ pub async fn timeline(
         blob,
     )
         .into_response())
+}
+
+/// GET /api/books/:id/text — the book as paragraphs of words, whose flattened
+/// order/count matches the timeline exactly (same flick-core tokenizer), so
+/// clients map the full-text view onto timeline indices 1:1. Books stored
+/// before v0.3b (no plaintext) `404` here (contract: still readable, no /text).
+pub async fn text(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let text = state
+        .db
+        .call(move |c| db::book_text(c, &user.id, &id))
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let paragraphs = flick_core::paragraphs(&text);
+    Ok(Json(json!({ "paragraphs": paragraphs })))
 }
 
 #[derive(Deserialize)]
