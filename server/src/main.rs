@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use flick_server::{app, config::Config, db::Db, AppState};
 use tracing_subscriber::EnvFilter;
 
@@ -39,8 +41,12 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
     tracing::info!("flick-server listening on {addr}");
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
+    // ConnectInfo carries the peer address into the rate limiter's client key.
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server run");
 }

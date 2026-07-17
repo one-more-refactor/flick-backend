@@ -13,6 +13,7 @@ pub mod import;
 pub mod integrations;
 pub mod mail;
 pub mod oidc;
+pub mod ratelimit;
 pub mod stats;
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub db: db::Db,
     pub config: Arc<Config>,
     pub oauth: Arc<oidc::OauthRuntime>,
+    pub limiter: Arc<ratelimit::RateLimiter>,
 }
 
 impl AppState {
@@ -43,7 +45,14 @@ impl AppState {
             db,
             config: Arc::new(config),
             oauth: Arc::new(oidc::OauthRuntime::default()),
+            limiter: Arc::new(ratelimit::RateLimiter::new(ratelimit::RateLimits::default())),
         }
+    }
+
+    /// Replace the contract-default rate limits (tests use tiny ones).
+    pub fn with_rate_limits(mut self, limits: ratelimit::RateLimits) -> Self {
+        self.limiter = Arc::new(ratelimit::RateLimiter::new(limits));
+        self
     }
 }
 
@@ -145,6 +154,10 @@ pub fn app(state: AppState) -> Router {
     };
 
     router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::rate_limit,
+        ))
         .layer(middleware::from_fn(cache_control))
         .layer(
             TraceLayer::new_for_http()

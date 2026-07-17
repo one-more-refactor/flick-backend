@@ -11,6 +11,7 @@ use tower::ServiceExt;
 
 use flick_server::config::{Config, OAuthCreds};
 use flick_server::db::Db;
+use flick_server::ratelimit::{RateLimits, Rule};
 use flick_server::{app, AppState};
 
 fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
@@ -37,6 +38,12 @@ fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
 fn test_app() -> (Router, tempfile::TempDir) {
     let (app, _state, dir) = test_app_with_state();
     (app, dir)
+}
+
+/// A test app with tiny rate limits so tests can hit 429 in a few requests.
+fn test_app_with_limits(limits: RateLimits) -> (Router, tempfile::TempDir) {
+    let (_, state, dir) = test_app_with_state();
+    (app(state.with_rate_limits(limits)), dir)
 }
 
 /// A test app whose `Config` is customized (used for the integrations
@@ -1344,4 +1351,148 @@ async fn integrations_null_and_configured() {
     let body = body_json(send(&app, bare_request("GET", "/api/integrations", None)).await).await;
     assert_eq!(body["google_picker"], Value::Null);
     assert_eq!(body["dropbox"], Value::Null);
+}
+
+// ------------------------------------------------------------ rate limits
+
+/// Attach a peer address the way `into_make_service_with_connect_info` does
+/// in production, so the limiter's client-key logic sees a real peer.
+fn with_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+    let addr: std::net::SocketAddr = peer.parse().expect("peer addr");
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    req
+}
+
+fn login_request(xff: Option<&str>) -> Request<Body> {
+    let mut req = json_request(
+        "POST",
+        "/api/auth/login",
+        None,
+        json!({"email": "nobody@example.com", "password": "wrong-password"}),
+    );
+    if let Some(fwd) = xff {
+        req.headers_mut()
+            .insert("x-forwarded-for", fwd.parse().expect("header"));
+    }
+    req
+}
+
+#[tokio::test]
+async fn login_hits_contract_limit_of_ten() {
+    // Default (contract) limits; no ConnectInfo → all requests share the
+    // "unknown" bucket, exactly like a single client.
+    let (app, _dir) = test_app();
+    for _ in 0..10 {
+        let resp = send(&app, login_request(None)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED); // counted, not limited
+    }
+    let resp = send(&app, login_request(None)).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn rate_limit_429_shape_and_unrelated_endpoints() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    for _ in 0..2 {
+        assert_eq!(
+            send(&app, login_request(None)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let resp = send(&app, login_request(None)).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Retry-After is whole seconds within the window.
+    let retry: u64 = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .expect("Retry-After header")
+        .to_str()
+        .expect("ascii")
+        .parse()
+        .expect("seconds");
+    assert!((1..=300).contains(&retry), "retry {retry}");
+
+    // Standard JSON error shape.
+    let body = body_json(resp).await;
+    assert!(body["error"].is_string());
+
+    // Unrelated endpoints are unaffected: other limited routes have their own
+    // buckets, unlimited routes never 429.
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/lookup", None, json!({"email": "a@b.c"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(&app, bare_request("GET", "/api/auth/me", None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = send(&app, bare_request("GET", "/api/catalog", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // And registering still works while login is exhausted.
+    register(&app, "unaffected@example.com").await;
+}
+
+#[tokio::test]
+async fn xff_from_loopback_peer_buckets_per_forwarded_ip() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    // Loopback peer (Caddy) → the forwarded client IP is the bucket key.
+    for _ in 0..2 {
+        let resp = send(
+            &app,
+            with_peer(login_request(Some("203.0.113.7")), "127.0.0.1:9999"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = send(
+        &app,
+        with_peer(login_request(Some("203.0.113.7")), "127.0.0.1:9999"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A different forwarded IP behind the same proxy is a fresh bucket.
+    let resp = send(
+        &app,
+        with_peer(login_request(Some("203.0.113.8")), "127.0.0.1:9999"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn xff_from_public_peer_is_ignored() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    // A public peer spoofing rotating X-Forwarded-For values must NOT get a
+    // fresh bucket each time — the peer address itself is the key.
+    for (i, spoof) in ["1.2.3.4", "5.6.7.8", "9.10.11.12"].iter().enumerate() {
+        let resp = send(
+            &app,
+            with_peer(login_request(Some(spoof)), "203.0.113.50:4433"),
+        )
+        .await;
+        let expect = if i < 2 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(resp.status(), expect, "request {i}");
+    }
 }
