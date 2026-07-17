@@ -12,8 +12,9 @@ pub mod oidc;
 
 use std::sync::Arc;
 
-use axum::extract::DefaultBodyLimit;
-use axum::http::{StatusCode, Uri};
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -50,6 +51,25 @@ async fn api_method_not_allowed() -> AppError {
         StatusCode::METHOD_NOT_ALLOWED,
         "method not allowed".into(),
     )
+}
+
+/// Cache policy for the static web client: hashed assets are immutable,
+/// everything else (index.html, manifest, sw.js) must revalidate — otherwise
+/// browsers heuristically cache the shell and users see stale deploys.
+/// `/api` responses are left untouched.
+async fn cache_control(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut res = next.run(req).await;
+    if !path.starts_with("/api") && res.status().is_success() {
+        let value = if path.starts_with("/assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    }
+    res
 }
 
 /// Plain-text fallback when FLICK_WEB_DIST has no built web client.
@@ -98,6 +118,7 @@ pub fn app(state: AppState) -> Router {
     };
 
     router
+        .layer(middleware::from_fn(cache_control))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
