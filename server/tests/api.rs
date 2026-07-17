@@ -312,18 +312,24 @@ async fn books_full_flow() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // list contains it
+    // list contains it (plus the seeded intro book)
     let resp = send(&app, bare_request("GET", "/api/books", Some(&cookie))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let list = body_json(resp).await;
-    assert_eq!(list.as_array().map(Vec::len), Some(1));
-    assert_eq!(list[0]["id"], id.as_str());
+    assert_eq!(list.as_array().map(Vec::len), Some(2));
+    assert!(list
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|b| b["id"] == id.as_str()));
 
     // delete, then everything 404s
     let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = send(&app, bare_request("GET", "/api/books", Some(&cookie))).await;
-    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(0));
+    let remaining = body_json(resp).await;
+    let remaining = remaining.as_array().expect("array");
+    assert!(remaining.iter().all(|b| b["id"] != id.as_str()));
     for req in [
         bare_request("GET", &format!("/api/books/{id}"), Some(&cookie)),
         bare_request("GET", &format!("/api/books/{id}/timeline"), Some(&cookie)),
@@ -369,11 +375,18 @@ async fn foreign_books_are_404() {
         let resp = send(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
-    // and Bob's list is empty while Alice still sees her book
+    // Bob sees only his own seeded intro book; Alice's book stays hers.
     let resp = send(&app, bare_request("GET", "/api/books", Some(&bob))).await;
-    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(0));
+    let bobs = body_json(resp).await;
+    let bobs = bobs.as_array().expect("array");
+    assert!(bobs.iter().all(|b| b["id"] != id.as_str()));
     let resp = send(&app, bare_request("GET", "/api/books", Some(&alice))).await;
-    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(1));
+    let alices = body_json(resp).await;
+    assert!(alices
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|b| b["id"] == id.as_str()));
 }
 
 #[tokio::test]
@@ -434,4 +447,98 @@ async fn missing_web_dist_serves_plain_text() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
     assert_eq!(&bytes[..], b"flick-server: web dist not found");
+}
+
+// ------------------------------------------------------- v0.2: profile
+
+#[tokio::test]
+async fn new_user_defaults_and_starter_book() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "fresh@example.com").await;
+
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["onboarded"], false);
+    assert_eq!(me["username"], Value::Null);
+    assert_eq!(me["settings"]["wpm"], 350);
+    assert_eq!(me["settings"]["theme"], "auto");
+
+    let books =
+        body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let books = books.as_array().expect("array");
+    assert_eq!(books.len(), 1);
+    assert_eq!(books[0]["source"], "intro");
+    assert_eq!(books[0]["title"], "Welcome to flick");
+    assert!(books[0]["word_count"].as_i64().expect("count") > 100);
+
+    // The intro book has a playable timeline like any other book.
+    let id = books[0]["id"].as_str().expect("id");
+    let resp = send(
+        &app,
+        bare_request("GET", &format!("/api/books/{id}/timeline"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tl = body_json(resp).await;
+    assert_eq!(tl["version"], 1);
+}
+
+#[tokio::test]
+async fn patch_me_full_onboarding() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "onboard@example.com").await;
+
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({
+                "username": "phil_22",
+                "onboarded": true,
+                "settings": {"wpm": 425, "theme": "dark"}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = body_json(resp).await;
+    assert_eq!(me["username"], "phil_22");
+    assert_eq!(me["onboarded"], true);
+    assert_eq!(me["settings"]["wpm"], 425);
+    assert_eq!(me["settings"]["theme"], "dark");
+
+    // Persisted, not just echoed.
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["username"], "phil_22");
+    assert_eq!(me["onboarded"], true);
+    assert_eq!(me["settings"]["wpm"], 425);
+}
+
+#[tokio::test]
+async fn patch_me_validation() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "invalid@example.com").await;
+
+    for (body, needle) in [
+        (json!({"username": "x"}), "username"),
+        (json!({"username": "has spaces"}), "username"),
+        (json!({"settings": {"wpm": 50}}), "wpm"),
+        (json!({"settings": {"wpm": 5000}}), "wpm"),
+        (json!({"settings": {"theme": "neon"}}), "theme"),
+        (json!({"name": "   "}), "name"),
+    ] {
+        let resp = send(&app, json_request("PATCH", "/api/auth/me", Some(&cookie), body)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(resp).await;
+        assert!(
+            err["error"].as_str().expect("msg").contains(needle),
+            "error should mention {needle}: {err}"
+        );
+    }
+
+    // Nothing partial was applied.
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["username"], Value::Null);
+    assert_eq!(me["settings"]["wpm"], 350);
 }

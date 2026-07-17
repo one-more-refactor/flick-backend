@@ -45,6 +45,51 @@ fn clean_title(title: Option<String>) -> Option<String> {
     title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
+// ------------------------------------------------------------ starter book
+
+const INTRO_TITLE: &str = "Welcome to flick";
+
+const INTRO_TEXT: &str = "\
+Welcome to flick.
+
+You are reading with your eye locked to one spot. The red letter is the anchor. \
+Words come to you, not the other way around. This is how you read faster.
+
+Press space to pause and resume. Tap the left or right side of the reader, or use \
+the arrow keys, to jump back or forward one sentence. The slider changes your \
+speed in words per minute.
+
+Start around 300. When that feels easy, go up by 50. Speed reading is a skill: at \
+first 400 feels fast, then it feels slow. Most people double their pace within a \
+week of practice.
+
+Notice how long words get a little more time. So do sentence endings, like this \
+one. That rhythm is computed for every book you add, so the pace always feels \
+natural.
+
+Add your own books with paste or PDF upload. Your reading position follows your \
+account across devices. You can delete this book whenever you are done with it.
+
+Happy flicking.";
+
+/// Seed the built-in intro book for a freshly created user (contract:
+/// every new user starts with one; `source: \"intro\"`).
+pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rusqlite::Result<()> {
+    let timeline = Timeline::from_text(INTRO_TEXT);
+    let timeline_json = serde_json::to_vec(&timeline).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+    })?;
+    let book = Book {
+        id: random_token(16),
+        title: INTRO_TITLE.into(),
+        source: "intro".into(),
+        word_count: timeline.word_count as i64,
+        position: 0,
+        created_at: now,
+    };
+    db::insert_book(c, user_id, &book, &timeline_json)
+}
+
 // --------------------------------------------------------------- handlers
 
 pub async fn list(

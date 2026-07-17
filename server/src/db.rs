@@ -37,6 +37,13 @@ CREATE TABLE books (
 CREATE INDEX books_user ON books(user_id, created_at);
 ";
 
+const SCHEMA_V2: &str = "
+ALTER TABLE users ADD COLUMN username TEXT;
+ALTER TABLE users ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN wpm INTEGER NOT NULL DEFAULT 350;
+ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'auto';
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -57,6 +64,11 @@ impl Db {
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2)?;
+            conn.pragma_update(None, "user_version", 2)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -96,6 +108,10 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub password_hash: Option<String>,
+    pub username: Option<String>,
+    pub onboarded: bool,
+    pub wpm: i64,
+    pub theme: String,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -104,10 +120,14 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         email: r.get(1)?,
         name: r.get(2)?,
         password_hash: r.get(3)?,
+        username: r.get(4)?,
+        onboarded: r.get::<_, i64>(5)? != 0,
+        wpm: r.get(6)?,
+        theme: r.get(7)?,
     })
 }
 
-const USER_COLS: &str = "id, email, name, password_hash";
+const USER_COLS: &str = "id, email, name, password_hash, username, onboarded, wpm, theme";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -148,6 +168,23 @@ pub fn insert_user(
     Ok(())
 }
 
+/// Persist the mutable profile fields of an already-merged `User`.
+pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET name = ?2, username = ?3, onboarded = ?4, wpm = ?5, theme = ?6
+         WHERE id = ?1",
+        params![
+            user.id,
+            user.name,
+            user.username,
+            user.onboarded as i64,
+            user.wpm,
+            user.theme
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn link_oidc_sub(c: &Connection, user_id: &str, sub: &str) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE users SET oidc_sub = ?2 WHERE id = ?1",
@@ -176,7 +213,7 @@ pub fn create_session(
 
 pub fn session_user(c: &Connection, token: &str, now: i64) -> rusqlite::Result<Option<User>> {
     c.query_row(
-        "SELECT u.id, u.email, u.name, u.password_hash
+        "SELECT u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, u.wpm, u.theme
          FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token = ?1 AND s.expires_at >= ?2",
         params![token, now],

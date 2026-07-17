@@ -234,13 +234,19 @@ pub async fn callback(
                 db::link_oidc_sub(c, &user.id, &sub)?;
                 return Ok(Ok(user));
             }
+            let (username, onboarded, wpm, theme) = crate::auth::new_user_defaults();
             let user = User {
                 id: new_id,
                 email,
                 name,
                 password_hash: None,
+                username,
+                onboarded,
+                wpm,
+                theme,
             };
             db::insert_user(c, &user, Some(&sub), now)?;
+            crate::books::seed_intro_book(c, &user.id, now)?;
             Ok(Ok(user))
         })
         .await?;

@@ -82,7 +82,19 @@ fn clear_session_cookie(secure: bool) -> String {
 }
 
 pub fn user_json(user: &User) -> Value {
-    json!({ "id": user.id, "email": user.email, "name": user.name })
+    json!({
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "username": user.username,
+        "onboarded": user.onboarded,
+        "settings": { "wpm": user.wpm, "theme": user.theme },
+    })
+}
+
+/// Field defaults for a brand-new user (contract: onboarded=false, 350 wpm, auto theme).
+pub fn new_user_defaults() -> (Option<String>, bool, i64, String) {
+    (None, false, 350, "auto".into())
 }
 
 /// Create a session row and return a response carrying the session cookie.
@@ -165,11 +177,16 @@ pub async fn register(
         .await
         .map_err(AppError::internal)??;
 
+    let (username, onboarded, wpm, theme) = new_user_defaults();
     let user = User {
         id: random_token(16),
         email,
         name,
         password_hash: Some(password_hash),
+        username,
+        onboarded,
+        wpm,
+        theme,
     };
     let now = now_secs();
     let inserted = state
@@ -181,6 +198,7 @@ pub async fn register(
                     return Ok(false);
                 }
                 db::insert_user(c, &user, None, now)?;
+                crate::books::seed_intro_book(c, &user.id, now)?;
                 Ok(true)
             }
         })
@@ -255,6 +273,73 @@ pub async fn logout(
 
 pub async fn me(AuthUser(user): AuthUser) -> Json<Value> {
     Json(user_json(&user))
+}
+
+#[derive(Deserialize)]
+pub struct SettingsPatch {
+    wpm: Option<i64>,
+    theme: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MePatch {
+    username: Option<String>,
+    name: Option<String>,
+    onboarded: Option<bool>,
+    settings: Option<SettingsPatch>,
+}
+
+fn valid_username(u: &str) -> bool {
+    (2..=24).contains(&u.len())
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+pub async fn update_me(
+    State(state): State<AppState>,
+    AuthUser(mut user): AuthUser,
+    AppJson(patch): AppJson<MePatch>,
+) -> Result<Response, AppError> {
+    if let Some(username) = patch.username {
+        let username = username.trim().to_string();
+        if !valid_username(&username) {
+            return Err(AppError::bad_request(
+                "username must be 2-24 characters: letters, digits, _ or -",
+            ));
+        }
+        user.username = Some(username);
+    }
+    if let Some(name) = patch.name {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(AppError::bad_request("name must not be empty"));
+        }
+        user.name = name;
+    }
+    if let Some(onboarded) = patch.onboarded {
+        user.onboarded = onboarded;
+    }
+    if let Some(settings) = patch.settings {
+        if let Some(wpm) = settings.wpm {
+            if !(100..=1200).contains(&wpm) {
+                return Err(AppError::bad_request("wpm must be between 100 and 1200"));
+            }
+            user.wpm = wpm;
+        }
+        if let Some(theme) = settings.theme {
+            if !matches!(theme.as_str(), "auto" | "light" | "dark") {
+                return Err(AppError::bad_request("theme must be auto, light, or dark"));
+            }
+            user.theme = theme;
+        }
+    }
+
+    let stored = user.clone();
+    state
+        .db
+        .call(move |c| db::update_profile(c, &stored))
+        .await?;
+    Ok(Json(user_json(&user)).into_response())
 }
 
 pub async fn providers(State(state): State<AppState>) -> Json<Value> {

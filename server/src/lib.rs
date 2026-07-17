@@ -67,7 +67,7 @@ fn api_router() -> Router<AppState> {
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
-        .route("/auth/me", get(auth::me))
+        .route("/auth/me", get(auth::me).patch(auth::update_me))
         .route("/auth/providers", get(auth::providers))
         .route("/auth/oidc/login", get(oidc::login))
         .route("/auth/oidc/callback", get(oidc::callback))
