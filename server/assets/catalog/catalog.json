@@ -1,0 +1,83 @@
+[
+  {
+    "slug": "gift-of-the-magi",
+    "file": "gift-of-the-magi.txt",
+    "title": "The Gift of the Magi",
+    "author": "O. Henry",
+    "lang": "en",
+    "kind": "story",
+    "description": "A young couple's Christmas sacrifice, with a twist ending."
+  },
+  {
+    "slug": "tell-tale-heart",
+    "file": "tell-tale-heart.txt",
+    "title": "The Tell-Tale Heart",
+    "author": "Edgar Allan Poe",
+    "lang": "en",
+    "kind": "story",
+    "description": "A murderer insists on his sanity as guilt closes in."
+  },
+  {
+    "slug": "owl-creek-bridge",
+    "file": "owl-creek-bridge.txt",
+    "title": "An Occurrence at Owl Creek Bridge",
+    "author": "Ambrose Bierce",
+    "lang": "en",
+    "kind": "story",
+    "description": "A Civil War hanging and a desperate escape that isn't."
+  },
+  {
+    "slug": "aesops-fables",
+    "file": "aesops-fables.txt",
+    "title": "Aesop's Fables (Selection)",
+    "author": "Aesop, trans. George Fyler Townsend",
+    "lang": "en",
+    "kind": "fables",
+    "description": "Classic bite-size fables with morals, ideal for sprints."
+  },
+  {
+    "slug": "scandal-in-bohemia",
+    "file": "scandal-in-bohemia.txt",
+    "title": "A Scandal in Bohemia",
+    "author": "Arthur Conan Doyle",
+    "lang": "en",
+    "kind": "story",
+    "description": "Sherlock Holmes is outwitted by the woman, Irene Adler."
+  },
+  {
+    "slug": "civil-disobedience",
+    "file": "civil-disobedience.txt",
+    "title": "On the Duty of Civil Disobedience",
+    "author": "Henry David Thoreau",
+    "lang": "en",
+    "kind": "essay",
+    "description": "Thoreau's essay on conscience versus unjust government."
+  },
+  {
+    "slug": "meditations",
+    "file": "meditations.txt",
+    "title": "Meditations (Books I-III)",
+    "author": "Marcus Aurelius, trans. Meric Casaubon",
+    "lang": "en",
+    "kind": "essay",
+    "description": "Stoic self-counsel from a Roman emperor, Books I to III."
+  },
+  {
+    "slug": "die-verwandlung",
+    "file": "die-verwandlung.txt",
+    "title": "Die Verwandlung",
+    "author": "Franz Kafka",
+    "lang": "de",
+    "kind": "novella",
+    "description": "Gregor Samsa erwacht als Ungeziefer — Kafkas Novelle."
+  },
+  {
+    "slug": "jekyll-and-hyde",
+    "file": "jekyll-and-hyde.txt",
+    "title": "The Strange Case of Dr. Jekyll and Mr. Hyde",
+    "author": "Robert Louis Stevenson",
+    "lang": "en",
+    "kind": "novella",
+    "description": "Stevenson's dark novella of a doctor's double life."
+  }
+]
