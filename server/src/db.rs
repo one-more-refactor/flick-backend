@@ -146,6 +146,13 @@ CREATE TRIGGER books_fts_au AFTER UPDATE ON books BEGIN
 END;
 ";
 
+/// v0.4: editions & plans — `users.plan` (`'free'` | `'pro'`). No API sets it
+/// (manual/admin only until billing exists); it is only read into user JSON
+/// and the hosted upload-limit check.
+const SCHEMA_V5: &str = "
+ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -186,6 +193,11 @@ impl Db {
         if version < 4 {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V4}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 4)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 5 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V5}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 5)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -232,6 +244,7 @@ pub struct User {
     pub guest: bool,
     pub accent: String,
     pub lang: String,
+    pub plan: String,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -247,13 +260,14 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         guest: r.get::<_, i64>(8)? != 0,
         accent: r.get(9)?,
         lang: r.get(10)?,
+        plan: r.get(11)?,
     })
 }
 
 const USER_COLS: &str =
-    "id, email, name, password_hash, username, onboarded, wpm, theme, guest, accent, lang";
+    "id, email, name, password_hash, username, onboarded, wpm, theme, guest, accent, lang, plan";
 const USER_COLS_U: &str = "u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, \
-                           u.wpm, u.theme, u.guest, u.accent, u.lang";
+                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -267,8 +281,8 @@ pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<Use
 pub fn insert_user(c: &Connection, user: &User, now: i64) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO users (id, email, name, password_hash, created_at,
-                            username, onboarded, wpm, theme, guest, accent, lang)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            username, onboarded, wpm, theme, guest, accent, lang, plan)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             user.id,
             user.email,
@@ -281,7 +295,8 @@ pub fn insert_user(c: &Connection, user: &User, now: i64) -> rusqlite::Result<()
             user.theme,
             user.guest as i64,
             user.accent,
-            user.lang
+            user.lang,
+            user.plan
         ],
     )?;
     Ok(())
@@ -606,6 +621,31 @@ pub fn book_count(c: &Connection, user_id: &str) -> rusqlite::Result<i64> {
     c.query_row(
         "SELECT COUNT(*) FROM books WHERE user_id = ?1",
         [user_id],
+        |r| r.get(0),
+    )
+}
+
+/// 00:00:00 UTC of the Monday opening `now`'s ISO-8601 week. Pure epoch
+/// arithmetic (1970-01-01 was a Thursday — ISO weekday 3, Monday = 0), so no
+/// date crate is needed; ISO weeks in UTC are exactly Monday-aligned 7-day
+/// spans of epoch days.
+pub fn iso_week_start(now: i64) -> i64 {
+    let days = now.div_euclid(86_400);
+    let weekday = (days + 3).rem_euclid(7); // Monday = 0
+    (days - weekday) * 86_400
+}
+
+/// User-sourced ingestions this ISO week (UTC): every book insert EXCEPT the
+/// intro seed and catalog copies (CONTRACTS.md "Editions & plans"). Derived
+/// from `books.created_at` instead of a separate counter table — deleting a
+/// book therefore refunds its upload for the week, a deliberate (and
+/// friendly) trade-off in exchange for having no second source of truth.
+pub fn uploads_this_week(c: &Connection, user_id: &str, now: i64) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM books
+         WHERE user_id = ?1 AND created_at >= ?2
+           AND source NOT IN ('intro', 'catalog')",
+        params![user_id, iso_week_start(now)],
         |r| r.get(0),
     )
 }

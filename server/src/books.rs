@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{random_token, AuthUser};
+use crate::config::{Config, Edition};
 use crate::db::{self, now_secs, Book};
 use crate::error::{AppError, AppJson, AppPath};
 use crate::import::{self, Prepared};
@@ -17,6 +18,17 @@ use crate::AppState;
 
 /// Upload/body cap (CONTRACTS.md: 25 MB).
 pub const UPLOAD_LIMIT: usize = 25 * 1024 * 1024;
+
+/// Hosted free plan: user-sourced uploads allowed per ISO week
+/// (CONTRACTS.md "Editions & plans").
+pub const WEEKLY_UPLOAD_LIMIT: i64 = 15;
+
+/// The user's weekly upload allowance — `Some(15)` only on the hosted
+/// edition's free plan (guests included); `None` = unlimited (selfhost
+/// edition, or pro).
+pub fn weekly_upload_limit(config: &Config, user: &db::User) -> Option<i64> {
+    (config.edition == Edition::Hosted && user.plan == "free").then_some(WEEKLY_UPLOAD_LIMIT)
+}
 
 const TITLE_CHARS: usize = 40;
 
@@ -229,15 +241,34 @@ async fn insert_prepared(
         excerpt,
         category,
     };
+    // Weekly limit (hosted free plan only): counted and enforced inside the
+    // insert closure so check + insert are atomic under the one connection.
+    let limit = weekly_upload_limit(&state.config, user);
     let stored = book.clone();
     let user = user.clone();
-    state
+    let inserted = state
         .db
         .call(move |c| {
+            if let Some(limit) = limit {
+                if db::uploads_this_week(c, &user.id, stored.created_at)? >= limit {
+                    return Ok(false);
+                }
+            }
             maybe_seed_guest_intro(c, &user, stored.created_at)?;
-            db::insert_book(c, &user.id, &stored, &timeline_json, Some(&text), None)
+            db::insert_book(c, &user.id, &stored, &timeline_json, Some(&text), None)?;
+            Ok(true)
         })
         .await?;
+    if !inserted {
+        return Err(AppError::Coded(
+            StatusCode::FORBIDDEN,
+            format!(
+                "you've reached the free plan's {WEEKLY_UPLOAD_LIMIT} uploads for this week — \
+                 the counter resets Monday (UTC), and everything already in your library stays"
+            ),
+            "upload_limit",
+        ));
+    }
     Ok((StatusCode::CREATED, Json(book)).into_response())
 }
 

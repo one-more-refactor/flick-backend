@@ -19,6 +19,11 @@ pub enum AppError {
     Conflict(String),
     /// Arbitrary status + message (body limits, upstream OIDC failures, ...).
     Status(StatusCode, String),
+    /// Like `Status`, plus a machine-readable `"code"` key in the JSON body
+    /// (`{"error": ..., "code": ...}`) for errors clients must branch on
+    /// (e.g. the hosted weekly upload limit). Everything else stays
+    /// `{"error"}`-only.
+    Coded(StatusCode, String, &'static str),
     Internal(String),
 }
 
@@ -40,24 +45,31 @@ impl From<rusqlite::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+        let (status, message, code) = match self {
+            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m, None),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "authentication required".to_string(),
+                None,
             ),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
-            Self::Conflict(m) => (StatusCode::CONFLICT, m),
-            Self::Status(s, m) => (s, m),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string(), None),
+            Self::Conflict(m) => (StatusCode::CONFLICT, m, None),
+            Self::Status(s, m) => (s, m, None),
+            Self::Coded(s, m, code) => (s, m, Some(code)),
             Self::Internal(m) => {
                 tracing::error!("internal error: {m}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),
+                    None,
                 )
             }
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let mut body = json!({ "error": message });
+        if let Some(code) = code {
+            body["code"] = json!(code);
+        }
+        (status, Json(body)).into_response()
     }
 }
 

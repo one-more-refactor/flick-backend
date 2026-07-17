@@ -15,6 +15,7 @@ async fn main() {
     let config = Config::from_env();
     let db = Db::open(&config.data_dir).expect("open sqlite database");
     let addr = config.addr.clone();
+    tracing::info!(edition = config.edition.as_str(), "flick edition");
     if config.oidc.is_some() {
         tracing::info!(name = %config.oidc_name, "OIDC SSO enabled (lazy discovery)");
     }
@@ -51,7 +52,20 @@ async fn main() {
         .expect("server run");
 }
 
+/// SIGINT (ctrl-c) or SIGTERM (systemd stop) — both drain gracefully.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutting down");
 }

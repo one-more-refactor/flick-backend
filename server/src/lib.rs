@@ -18,12 +18,13 @@ pub mod stats;
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::Router;
+use axum::{Json, Router};
+use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -54,6 +55,16 @@ impl AppState {
         self.limiter = Arc::new(ratelimit::RateLimiter::new(limits));
         self
     }
+}
+
+/// GET /api/meta — public, no auth: which edition this server runs and its
+/// version. Clients switch the Pro/Contribute UI on `edition` (CONTRACTS.md
+/// "Editions & plans").
+async fn meta(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "edition": state.config.edition.as_str(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn api_not_found() -> AppError {
@@ -103,6 +114,7 @@ async fn no_web_dist(uri: Uri) -> Response {
 
 fn api_router() -> Router<AppState> {
     Router::new()
+        .route("/meta", get(meta))
         .route("/auth/guest", post(auth::guest))
         .route("/auth/lookup", post(auth::lookup))
         .route("/auth/register", post(auth::register))

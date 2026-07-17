@@ -9,7 +9,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use flick_server::config::{Config, OAuthCreds};
+use flick_server::config::{Config, Edition, OAuthCreds};
 use flick_server::db::Db;
 use flick_server::ratelimit::{RateLimits, Rule};
 use flick_server::{app, AppState};
@@ -17,6 +17,7 @@ use flick_server::{app, AppState};
 fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
+        edition: Edition::Selfhost,
         addr: "127.0.0.1:0".into(),
         data_dir: dir.path().join("data"),
         public_url: "http://localhost:8484".into(),
@@ -51,6 +52,7 @@ fn test_app_with_limits(limits: RateLimits) -> (Router, tempfile::TempDir) {
 fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = Config {
+        edition: Edition::Selfhost,
         addr: "127.0.0.1:0".into(),
         data_dir: dir.path().join("data"),
         public_url: "http://localhost:8484".into(),
@@ -1351,6 +1353,121 @@ async fn integrations_null_and_configured() {
     let body = body_json(send(&app, bare_request("GET", "/api/integrations", None)).await).await;
     assert_eq!(body["google_picker"], Value::Null);
     assert_eq!(body["dropbox"], Value::Null);
+}
+
+// -------------------------------------------------------- editions & plans
+
+#[tokio::test]
+async fn meta_reports_selfhost_edition_and_version() {
+    let (app, _dir) = test_app();
+    // Public: no auth cookie.
+    let resp = send(&app, bare_request("GET", "/api/meta", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body,
+        json!({"edition": "selfhost", "version": env!("CARGO_PKG_VERSION")})
+    );
+}
+
+#[tokio::test]
+async fn hosted_free_plan_enforces_weekly_upload_limit() {
+    let (app, _dir) = test_app_with_config(|c| c.edition = Edition::Hosted);
+    let cookie = register(&app, "limited@example.com").await;
+
+    let body = body_json(send(&app, bare_request("GET", "/api/meta", None)).await).await;
+    assert_eq!(body["edition"], "hosted");
+
+    // The intro seed never counts: a fresh account starts at 0/15.
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 0, "limit": 15}));
+
+    // 15 paste uploads all pass (POST /api/books has no rate limit).
+    let mut last_book_id = String::new();
+    for i in 0..15 {
+        let book = create_paste_book(
+            &app,
+            &cookie,
+            Some(&format!("Book {i}")),
+            "a few words to read",
+        )
+        .await;
+        last_book_id = book["id"].as_str().expect("book id").to_string();
+    }
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 15, "limit": 15}));
+
+    // The 16th is refused with the contract shape: {"error", "code"}.
+    let resp = send(
+        &app,
+        json_request("POST", "/api/books", Some(&cookie), json!({"text": "one more"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()));
+    assert_eq!(body["code"], "upload_limit");
+
+    // Catalog adds neither count nor get blocked at the limit.
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 15, "limit": 15}));
+
+    // The counter derives from `books`, so deleting one refunds the upload.
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{last_book_id}"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    create_paste_book(&app, &cookie, Some("After refund"), "room for one more").await;
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 15, "limit": 15}));
+}
+
+#[tokio::test]
+async fn hosted_guests_are_limited_too() {
+    let (app, _dir) = test_app_with_config(|c| c.edition = Edition::Hosted);
+    let resp = send(&app, bare_request("POST", "/api/auth/guest", None)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cookie = session_cookie(&resp);
+    // Auth responses carry the uploads object too (they share user_json).
+    let user = body_json(resp).await;
+    assert_eq!(user["uploads"], json!({"used": 0, "limit": 15}));
+
+    // 15 pastes pass (the lazily seeded guest intro book doesn't count) ...
+    for i in 0..15 {
+        create_paste_book(&app, &cookie, Some(&format!("Guest {i}")), "guest words").await;
+    }
+    // ... and the 16th is the same 403 as for registered users.
+    let resp = send(
+        &app,
+        json_request("POST", "/api/books", Some(&cookie), json!({"text": "over quota"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "upload_limit");
+}
+
+#[tokio::test]
+async fn selfhost_uploads_are_unlimited() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "unlimited@example.com").await;
+
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 0, "limit": null}));
+
+    // One past the hosted limit: never a 403 on selfhost.
+    for i in 0..16 {
+        create_paste_book(&app, &cookie, Some(&format!("Free {i}")), "free forever").await;
+    }
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["uploads"], json!({"used": 16, "limit": null}));
 }
 
 // ------------------------------------------------------------ rate limits

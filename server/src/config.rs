@@ -2,6 +2,25 @@
 
 use std::path::PathBuf;
 
+/// Which product edition this server runs (CONTRACTS.md "Editions & plans"):
+/// `selfhost` (the default — everything free, nothing enforced) or `hosted`
+/// (the free/pro plans apply). Clients switch Pro/Contribute UI on
+/// `GET /api/meta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edition {
+    Selfhost,
+    Hosted,
+}
+
+impl Edition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Edition::Selfhost => "selfhost",
+            Edition::Hosted => "hosted",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OidcSettings {
     pub issuer: String,
@@ -18,6 +37,7 @@ pub struct OAuthCreds {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub edition: Edition,
     pub addr: String,
     pub data_dir: PathBuf,
     pub public_url: String,
@@ -83,7 +103,19 @@ impl Config {
             }),
             _ => None,
         };
+        let edition = match env_var("FLICK_EDITION").as_deref() {
+            None | Some("selfhost") => Edition::Selfhost,
+            Some("hosted") => Edition::Hosted,
+            Some(other) => {
+                tracing::warn!(
+                    value = %other,
+                    "unknown FLICK_EDITION (expected \"selfhost\" or \"hosted\") — using selfhost"
+                );
+                Edition::Selfhost
+            }
+        };
         Config {
+            edition,
             addr: env_var("FLICK_ADDR").unwrap_or_else(|| "0.0.0.0:8484".into()),
             data_dir: env_var("FLICK_DATA_DIR")
                 .unwrap_or_else(|| "./data".into())

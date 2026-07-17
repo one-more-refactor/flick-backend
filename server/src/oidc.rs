@@ -505,7 +505,8 @@ async fn complete(
 
     merge_guest_from_request(state, headers, &user.id).await?;
 
-    let mut resp = start_session(state, &user.id, StatusCode::FOUND, user_json(&user)).await?;
+    let body = user_json(state, &user).await?;
+    let mut resp = start_session(state, &user.id, StatusCode::FOUND, body).await?;
     resp.headers_mut()
         .insert(header::LOCATION, HeaderValue::from_static("/"));
     resp.headers_mut().append(

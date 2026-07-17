@@ -98,8 +98,19 @@ fn clear_session_cookie(secure: bool) -> String {
     )
 }
 
-pub fn user_json(user: &User) -> Value {
-    json!({
+/// The contract user object. Async because `"uploads"` carries the live
+/// weekly counter (CONTRACTS.md "Editions & plans": `limit` is 15 on the
+/// hosted free plan, `null` = unlimited otherwise) — every auth response
+/// that returns user JSON goes through here.
+pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError> {
+    let uid = user.id.clone();
+    let now = now_secs();
+    let used = state
+        .db
+        .call(move |c| db::uploads_this_week(c, &uid, now))
+        .await?;
+    let limit = crate::books::weekly_upload_limit(&state.config, user);
+    Ok(json!({
         "id": user.id,
         "email": user.email,
         "name": user.name,
@@ -112,7 +123,8 @@ pub fn user_json(user: &User) -> Value {
             "accent": user.accent,
             "lang": user.lang,
         },
-    })
+        "uploads": {"used": used, "limit": limit},
+    }))
 }
 
 /// A brand-new user with contract defaults (onboarded=false, 350 wpm, auto
@@ -135,6 +147,7 @@ pub fn new_user(
         guest,
         accent: "red".into(),
         lang: "auto".into(),
+        plan: "free".into(),
     }
 }
 
@@ -225,7 +238,8 @@ pub async fn guest(State(state): State<AppState>) -> Result<Response, AppError> 
         .db
         .call(move |c| db::insert_user(c, &stored, now))
         .await?;
-    start_session(&state, &user.id, StatusCode::CREATED, user_json(&user)).await
+    let body = user_json(&state, &user).await?;
+    start_session(&state, &user.id, StatusCode::CREATED, body).await
 }
 
 #[derive(Deserialize)]
@@ -349,7 +363,8 @@ pub async fn code_verify(
         return Err(AppError::bad_request("invalid code"));
     };
     merge_guest_from_request(&state, &headers, &user.id).await?;
-    start_session(&state, &user.id, StatusCode::OK, user_json(&user)).await
+    let body = user_json(&state, &user).await?;
+    start_session(&state, &user.id, StatusCode::OK, body).await
 }
 
 #[derive(Deserialize)]
@@ -409,7 +424,8 @@ pub async fn register(
     }
 
     merge_guest_from_request(&state, &headers, &user.id).await?;
-    start_session(&state, &user.id, StatusCode::CREATED, user_json(&user)).await
+    let body = user_json(&state, &user).await?;
+    start_session(&state, &user.id, StatusCode::CREATED, body).await
 }
 
 #[derive(Deserialize)]
@@ -445,7 +461,8 @@ pub async fn login(
     match user {
         Some(user) if ok => {
             merge_guest_from_request(&state, &headers, &user.id).await?;
-            start_session(&state, &user.id, StatusCode::OK, user_json(&user)).await
+            let body = user_json(&state, &user).await?;
+            start_session(&state, &user.id, StatusCode::OK, body).await
         }
         _ => Err(AppError::Status(
             StatusCode::UNAUTHORIZED,
@@ -473,8 +490,11 @@ pub async fn logout(
     Ok(resp)
 }
 
-pub async fn me(AuthUser(user): AuthUser) -> Json<Value> {
-    Json(user_json(&user))
+pub async fn me(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(user_json(&state, &user).await?))
 }
 
 #[derive(Deserialize)]
@@ -560,7 +580,7 @@ pub async fn update_me(
         .db
         .call(move |c| db::update_profile(c, &stored))
         .await?;
-    Ok(Json(user_json(&user)).into_response())
+    Ok(Json(user_json(&state, &user).await?).into_response())
 }
 
 /// GET /api/auth/providers — the configured sign-in providers only.
