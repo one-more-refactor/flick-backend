@@ -22,7 +22,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
@@ -129,6 +129,10 @@ fn api_router() -> Router<AppState> {
         .route("/auth/oidc/login", get(oidc::oidc_login_alias))
         .route("/auth/oidc/callback", get(oidc::oidc_callback_alias))
         .route("/books", get(books::list).post(books::create))
+        .route("/books/trash", get(books::list_trash))
+        .route("/books/{id}/restore", post(books::restore_book))
+        .route("/books/{id}/purge", delete(books::purge_book))
+        .route("/books/{id}/tags", put(books::set_tags))
         .route("/import/url", post(books::import_url))
         .route("/import/html", post(books::import_html))
         .route(

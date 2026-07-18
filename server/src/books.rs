@@ -106,6 +106,7 @@ pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rus
         favicon: None,
         excerpt: None,
         category: None,
+        tags: Vec::new(),
     };
     db::insert_book(c, user_id, &book, &timeline_json, Some(INTRO_TEXT), None)
 }
@@ -240,6 +241,9 @@ async fn insert_prepared(
         url,
         favicon,
         excerpt,
+        // Auto-tag with the category so mass imports arrive pre-sorted
+        // (contract v0.4.3); users refine via PUT /tags.
+        tags: category.iter().cloned().collect(),
         category,
     };
     // Weekly limit (hosted free plan only): counted and enforced inside the
@@ -616,18 +620,143 @@ pub async fn set_position(
     }
 }
 
+/// The auto-purge cutoff for now: everything trashed longer ago than the
+/// retention window gets dropped whenever the trash is touched.
+fn purge_cutoff(now: i64) -> i64 {
+    now - db::TRASH_RETENTION_DAYS * 86_400
+}
+
+/// DELETE /api/books/{id} — soft delete: the book moves to the trash
+/// (contract v0.4.3), restorable for TRASH_RETENTION_DAYS.
 pub async fn delete_book(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     AppPath(id): AppPath<String>,
 ) -> Result<StatusCode, AppError> {
-    let deleted = state
+    let now = now_secs();
+    let trashed = state
         .db
-        .call(move |c| db::delete_book(c, &user.id, &id))
+        .call(move |c| {
+            db::purge_expired(c, &user.id, purge_cutoff(now))?;
+            db::trash_book(c, &user.id, &id, now)
+        })
         .await?;
-    if deleted {
+    if trashed {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
     }
+}
+
+/// GET /api/books/trash — trashed books, newest first, with their expiry.
+pub async fn list_trash(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<Json<Value>, AppError> {
+    let now = now_secs();
+    let rows = state
+        .db
+        .call(move |c| {
+            db::purge_expired(c, &user.id, purge_cutoff(now))?;
+            db::list_trash(c, &user.id)
+        })
+        .await?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|(b, deleted_at)| {
+            json!({
+                "id": b.id,
+                "title": b.title,
+                "author": b.author,
+                "word_count": b.word_count,
+                "deleted_at": deleted_at,
+                "expires_at": deleted_at + db::TRASH_RETENTION_DAYS * 86_400,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "items": items,
+        "retention_days": db::TRASH_RETENTION_DAYS,
+    })))
+}
+
+/// POST /api/books/{id}/restore — bring a trashed book back.
+pub async fn restore_book(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+) -> Result<StatusCode, AppError> {
+    let restored = state
+        .db
+        .call(move |c| db::restore_book(c, &user.id, &id))
+        .await?;
+    if restored {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// DELETE /api/books/{id}/purge — hard-delete a trashed book right away.
+pub async fn purge_book(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+) -> Result<StatusCode, AppError> {
+    let purged = state
+        .db
+        .call(move |c| db::purge_book(c, &user.id, &id))
+        .await?;
+    if purged {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TagsBody {
+    tags: Vec<String>,
+}
+
+const MAX_TAGS: usize = 12;
+const MAX_TAG_CHARS: usize = 24;
+
+/// PUT /api/books/{id}/tags — replace a book's tags (≤12 tags, each 1–24
+/// chars, trimmed, deduped case-insensitively, order preserved).
+pub async fn set_tags(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+    AppJson(body): AppJson<TagsBody>,
+) -> Result<Json<Book>, AppError> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in body.tags {
+        let tag = raw.trim().to_string();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_CHARS {
+            return Err(AppError::bad_request("tags must be at most 24 characters"));
+        }
+        if seen.insert(tag.to_lowercase()) {
+            tags.push(tag);
+        }
+    }
+    if tags.len() > MAX_TAGS {
+        return Err(AppError::bad_request("at most 12 tags per book"));
+    }
+    let tags_json = serde_json::to_string(&tags).map_err(AppError::internal)?;
+    let book = state
+        .db
+        .call(move |c| {
+            if !db::set_tags(c, &user.id, &id, &tags_json)? {
+                return Ok(None);
+            }
+            db::get_book(c, &user.id, &id)
+        })
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(book))
 }

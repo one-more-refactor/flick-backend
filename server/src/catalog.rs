@@ -142,6 +142,9 @@ pub fn seed_default_library(
             favicon: None,
             excerpt: None,
             category: category_for(&entry.kind).map(str::to_string),
+            tags: category_for(&entry.kind)
+                .map(|k| vec![k.to_string()])
+                .unwrap_or_default(),
         };
         db::insert_book(
             c,
@@ -222,6 +225,9 @@ pub async fn add(
                 favicon: None,
                 excerpt: None,
                 category: category_for(&entry.kind).map(str::to_string),
+                tags: category_for(&entry.kind)
+                    .map(|k| vec![k.to_string()])
+                    .unwrap_or_default(),
             };
             // Store the raw catalog text so /text + search work on it too.
             db::insert_book(

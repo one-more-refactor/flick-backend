@@ -1040,12 +1040,137 @@ async fn sessions_post_list_and_clamps() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Deleting the book keeps the feed working with a DELETED marker.
+    // Trashing the book keeps its title in the feed (the row still exists,
+    // v0.4.3 soft delete); only a purge degrades it to the DELETED marker.
     let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
+    assert_eq!(list[0]["book_title"], "Session Book");
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}/purge"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
     assert_eq!(list[0]["book_title"], "DELETED");
     assert_eq!(list[1]["book_title"], "DELETED");
+}
+
+#[tokio::test]
+async fn trash_restore_purge_and_tags() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "trash@example.com").await;
+    let book = create_paste_book(&app, &cookie, Some("Bin me"), "Words that will be binned.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+    // Auto-tags: a paste has no category, so it starts untagged; catalog
+    // seeds carry their category as a tag.
+    assert_eq!(book["tags"], json!([]));
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let kafka = books
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|b| b["title"] == "Die Verwandlung")
+        .expect("seeded verwandlung")
+        .clone();
+    assert_eq!(kafka["tags"], json!(["book"]));
+
+    // Tags: set, dedupe (case-insensitive), trim; invalid ones are 400s.
+    let resp = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/books/{id}/tags"),
+            Some(&cookie),
+            json!({"tags": [" sci-fi ", "Sci-Fi", "work", ""]}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["tags"], json!(["sci-fi", "work"]));
+    let resp = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/api/books/{id}/tags"),
+            Some(&cookie),
+            json!({"tags": ["a-tag-name-that-is-way-way-too-long"]}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Trash: the book vanishes from every live surface but sits in the bin.
+    let count_before = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await)
+        .await
+        .as_array()
+        .expect("array")
+        .len();
+    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    for path in [
+        format!("/api/books/{id}"),
+        format!("/api/books/{id}/timeline"),
+        format!("/api/books/{id}/text"),
+    ] {
+        let resp = send(&app, bare_request("GET", &path, Some(&cookie))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    assert_eq!(books.as_array().expect("array").len(), count_before - 1);
+    // Search must not surface trashed books either.
+    let hits = body_json(send(&app, bare_request("GET", "/api/books?q=binned", Some(&cookie))).await)
+        .await;
+    assert_eq!(hits.as_array().map(Vec::len), Some(0));
+    let trash = body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await)
+        .await;
+    assert_eq!(trash["retention_days"], 30);
+    assert_eq!(trash["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(trash["items"][0]["id"], id.as_str());
+    assert_eq!(trash["items"][0]["title"], "Bin me");
+    assert!(trash["items"][0]["expires_at"].as_i64().expect("expiry") > 0);
+
+    // A second delete of the same book is a 404 (it is no longer live).
+    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Restore: back in the library with tags intact, trash empty again.
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/books/{id}/restore"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let book = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}"), Some(&cookie))).await)
+        .await;
+    assert_eq!(book["tags"], json!(["sci-fi", "work"]));
+    let trash = body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await)
+        .await;
+    assert_eq!(trash["items"].as_array().map(Vec::len), Some(0));
+    // Restore / purge on a live book are 404s.
+    for req in [
+        bare_request("POST", &format!("/api/books/{id}/restore"), Some(&cookie)),
+        bare_request("DELETE", &format!("/api/books/{id}/purge"), Some(&cookie)),
+    ] {
+        let resp = send(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Trash again, purge for good: gone from the bin AND unrestorable.
+    send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}/purge"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/books/{id}/restore"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // -------------------------------------------------------- v0.3: catalog

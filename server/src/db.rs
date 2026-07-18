@@ -153,6 +153,15 @@ const SCHEMA_V5: &str = "
 ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';
 ";
 
+/// v0.4.3: trash-bin soft delete (`deleted_at`, NULL = live; trashed rows are
+/// invisible to every live query and auto-purged after 30 days) and tags
+/// (JSON array of strings, `'[]'` default).
+const SCHEMA_V6: &str = "
+ALTER TABLE books ADD COLUMN deleted_at INTEGER;
+ALTER TABLE books ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+CREATE INDEX books_trash ON books(user_id, deleted_at);
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -198,6 +207,11 @@ impl Db {
         if version < 5 {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V5}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 5)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 6 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V6}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 6)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -528,6 +542,7 @@ pub struct Book {
     pub favicon: Option<String>,
     pub excerpt: Option<String>,
     pub category: Option<String>,
+    pub tags: Vec<String>,
 }
 
 fn row_book(r: &Row) -> rusqlite::Result<Book> {
@@ -544,11 +559,12 @@ fn row_book(r: &Row) -> rusqlite::Result<Book> {
         favicon: r.get(9)?,
         excerpt: r.get(10)?,
         category: r.get(11)?,
+        tags: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
     })
 }
 
 const BOOK_COLS: &str = "id, title, source, word_count, position, created_at, \
-                         last_read_at, author, url, favicon, excerpt, category";
+                         last_read_at, author, url, favicon, excerpt, category, tags";
 
 pub fn insert_book(
     c: &Connection,
@@ -561,8 +577,8 @@ pub fn insert_book(
     c.execute(
         "INSERT INTO books (id, user_id, title, source, word_count, position, timeline,
                             created_at, last_read_at, author, url, favicon, excerpt,
-                            category, catalog_slug, text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                            category, catalog_slug, text, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             book.id,
             user_id,
@@ -579,7 +595,9 @@ pub fn insert_book(
             book.excerpt,
             book.category,
             catalog_slug,
-            text
+            text,
+            serde_json::to_string(&book.tags)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
         ],
     )?;
     Ok(())
@@ -589,7 +607,7 @@ pub fn insert_book(
 /// missing or predates text storage (v0.3b backfilled such rows as NULL).
 pub fn book_text(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<String>> {
     c.query_row(
-        "SELECT text FROM books WHERE id = ?1 AND user_id = ?2",
+        "SELECT text FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
         params![id, user_id],
         |r| r.get::<_, Option<String>>(0),
     )
@@ -607,7 +625,7 @@ pub fn search_books(
     let mut stmt = c.prepare(&format!(
         "SELECT {} FROM books_fts
          JOIN books b ON b.rowid = books_fts.rowid
-         WHERE books_fts MATCH ?1 AND b.user_id = ?2
+         WHERE books_fts MATCH ?1 AND b.user_id = ?2 AND b.deleted_at IS NULL
          ORDER BY books_fts.rank",
         BOOK_COLS
             .split(", ")
@@ -621,7 +639,8 @@ pub fn search_books(
 
 pub fn list_books(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<Book>> {
     let mut stmt = c.prepare(&format!(
-        "SELECT {BOOK_COLS} FROM books WHERE user_id = ?1 ORDER BY created_at DESC, id"
+        "SELECT {BOOK_COLS} FROM books WHERE user_id = ?1 AND deleted_at IS NULL \
+         ORDER BY created_at DESC, id"
     ))?;
     let rows = stmt.query_map([user_id], row_book)?;
     rows.collect()
@@ -629,7 +648,7 @@ pub fn list_books(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<Book>> 
 
 pub fn get_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<Book>> {
     c.query_row(
-        &format!("SELECT {BOOK_COLS} FROM books WHERE id = ?1 AND user_id = ?2"),
+        &format!("SELECT {BOOK_COLS} FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL"),
         params![id, user_id],
         row_book,
     )
@@ -638,7 +657,7 @@ pub fn get_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Opt
 
 pub fn book_count(c: &Connection, user_id: &str) -> rusqlite::Result<i64> {
     c.query_row(
-        "SELECT COUNT(*) FROM books WHERE user_id = ?1",
+        "SELECT COUNT(*) FROM books WHERE user_id = ?1 AND deleted_at IS NULL",
         [user_id],
         |r| r.get(0),
     )
@@ -662,7 +681,7 @@ pub fn iso_week_start(now: i64) -> i64 {
 pub fn uploads_this_week(c: &Connection, user_id: &str, now: i64) -> rusqlite::Result<i64> {
     c.query_row(
         "SELECT COUNT(*) FROM books
-         WHERE user_id = ?1 AND created_at >= ?2
+         WHERE user_id = ?1 AND created_at >= ?2 AND deleted_at IS NULL
            AND source NOT IN ('intro', 'catalog')",
         params![user_id, iso_week_start(now)],
         |r| r.get(0),
@@ -676,7 +695,7 @@ pub fn book_id_by_catalog_slug(
     slug: &str,
 ) -> rusqlite::Result<Option<String>> {
     c.query_row(
-        "SELECT id FROM books WHERE user_id = ?1 AND catalog_slug = ?2",
+        "SELECT id FROM books WHERE user_id = ?1 AND catalog_slug = ?2 AND deleted_at IS NULL",
         params![user_id, slug],
         |r| r.get(0),
     )
@@ -685,7 +704,7 @@ pub fn book_id_by_catalog_slug(
 
 pub fn get_timeline(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<Vec<u8>>> {
     c.query_row(
-        "SELECT timeline FROM books WHERE id = ?1 AND user_id = ?2",
+        "SELECT timeline FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
         params![id, user_id],
         |r| r.get(0),
     )
@@ -700,17 +719,70 @@ pub fn set_position(
     now: i64,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE books SET position = ?3, last_read_at = ?4 WHERE id = ?1 AND user_id = ?2",
+        "UPDATE books SET position = ?3, last_read_at = ?4
+         WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
         params![id, user_id, position, now],
     )?;
     Ok(())
 }
 
-/// Returns false when no such book belongs to the user.
-pub fn delete_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
+/// Days a trashed book survives before auto-purge (contract v0.4.3).
+pub const TRASH_RETENTION_DAYS: i64 = 30;
+
+/// Soft-delete: move a live book to the trash. False when no live book
+/// matches.
+pub fn trash_book(c: &Connection, user_id: &str, id: &str, now: i64) -> rusqlite::Result<bool> {
     let n = c.execute(
-        "DELETE FROM books WHERE id = ?1 AND user_id = ?2",
+        "UPDATE books SET deleted_at = ?3 WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+        params![id, user_id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Bring a trashed book back to the library. False when not in the trash.
+pub fn restore_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "UPDATE books SET deleted_at = NULL
+         WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL",
         params![id, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Hard-delete a trashed book. False when not in the trash.
+pub fn purge_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "DELETE FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL",
+        params![id, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Drop everything trashed before `cutoff` (auto-purge sweep).
+pub fn purge_expired(c: &Connection, user_id: &str, cutoff: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM books WHERE user_id = ?1 AND deleted_at IS NOT NULL AND deleted_at < ?2",
+        params![user_id, cutoff],
+    )?;
+    Ok(())
+}
+
+/// The trash, newest first.
+pub fn list_trash(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<(Book, i64)>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {BOOK_COLS}, deleted_at FROM books
+         WHERE user_id = ?1 AND deleted_at IS NOT NULL
+         ORDER BY deleted_at DESC, id"
+    ))?;
+    let rows = stmt.query_map([user_id], |r| Ok((row_book(r)?, r.get(13)?)))?;
+    rows.collect()
+}
+
+/// Replace a live book's tags (already validated + serialized by the caller).
+pub fn set_tags(c: &Connection, user_id: &str, id: &str, tags_json: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "UPDATE books SET tags = ?3 WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+        params![id, user_id, tags_json],
     )?;
     Ok(n > 0)
 }
@@ -771,7 +843,8 @@ pub fn stats_totals(c: &Connection, user_id: &str) -> rusqlite::Result<StatsTota
     )?;
     let books_finished = c.query_row(
         "SELECT COUNT(*) FROM books
-         WHERE user_id = ?1 AND word_count > 0 AND position >= word_count",
+         WHERE user_id = ?1 AND word_count > 0 AND position >= word_count
+           AND deleted_at IS NULL",
         [user_id],
         |r| r.get(0),
     )?;
