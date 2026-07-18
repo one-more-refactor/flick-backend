@@ -109,7 +109,13 @@ pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError>
         .db
         .call(move |c| db::uploads_this_week(c, &uid, now))
         .await?;
-    let limit = crate::books::weekly_upload_limit(&state.config, user);
+    let pro = crate::books::pro_active(state, user).await?;
+    let limit = crate::books::weekly_upload_limit(&state.config, user, pro);
+    let pro_days = if user.pro_until > now {
+        (user.pro_until - now).div_euclid(86_400) + 1
+    } else {
+        0
+    };
     Ok(json!({
         "id": user.id,
         "email": user.email,
@@ -118,6 +124,8 @@ pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError>
         "guest": user.guest,
         "onboarded": user.onboarded,
         "plan": user.plan,
+        "pro_active": pro,
+        "pro_days": pro_days,
         "settings": {
             "wpm": user.wpm,
             "theme": user.theme,
@@ -149,6 +157,7 @@ pub fn new_user(
         accent: "red".into(),
         lang: "auto".into(),
         plan: "free".into(),
+        pro_until: 0,
     }
 }
 
@@ -231,14 +240,35 @@ impl FromRequestParts<AppState> for AuthUser {
 
 /// POST /api/auth/guest — anonymous user row + session (no intro book; that
 /// is seeded alongside the guest's first own add, see books.rs).
-pub async fn guest(State(state): State<AppState>) -> Result<Response, AppError> {
+#[derive(Deserialize, Default)]
+pub struct GuestBody {
+    #[serde(rename = "ref")]
+    ref_code: Option<String>,
+}
+
+pub async fn guest(
+    State(state): State<AppState>,
+    ip: crate::ratelimit::ClientIp,
+    body: axum::body::Bytes,
+) -> Result<Response, AppError> {
     let user = new_user(None, "READER".into(), None, true);
     let now = now_secs();
     let stored = user.clone();
+    // Optional {"ref": code} body — absent bodies are fine.
+    let ref_code = serde_json::from_slice::<GuestBody>(&body)
+        .ok()
+        .and_then(|b| b.ref_code)
+        .filter(|c| !c.is_empty());
+    let ip = ip.0;
     state
         .db
         .call(move |c| {
             db::insert_user(c, &stored, now)?;
+            if let Some(code) = ref_code {
+                if let Some(referrer) = db::user_id_by_ref_code(c, &code)? {
+                    db::set_referred_by(c, &stored.id, &referrer, &ip)?;
+                }
+            }
             // Contract "Starter library": no library ever starts empty.
             crate::catalog::seed_default_library(c, &stored.id, now)
         })
@@ -377,11 +407,14 @@ pub struct RegisterBody {
     email: String,
     password: String,
     name: Option<String>,
+    #[serde(rename = "ref", default)]
+    ref_code: Option<String>,
 }
 
 pub async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ip: crate::ratelimit::ClientIp,
     AppJson(body): AppJson<RegisterBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
@@ -401,6 +434,7 @@ pub async fn register(
         .or_else(|| email.split('@').next().map(str::to_string))
         .unwrap_or_else(|| "reader".into());
 
+    let body_ref = body.ref_code.clone();
     let password = body.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
@@ -408,6 +442,8 @@ pub async fn register(
 
     let user = new_user(Some(email), name, Some(password_hash), false);
     let now = now_secs();
+    let ref_code = body_ref.filter(|c| !c.is_empty());
+    let ip = ip.0;
     let inserted = state
         .db
         .call({
@@ -417,6 +453,11 @@ pub async fn register(
                     return Ok(false);
                 }
                 db::insert_user(c, &user, now)?;
+                if let Some(code) = &ref_code {
+                    if let Some(referrer) = db::user_id_by_ref_code(c, code)? {
+                        db::set_referred_by(c, &user.id, &referrer, &ip)?;
+                    }
+                }
                 crate::catalog::seed_default_library(c, &user.id, now)?;
                 Ok(true)
             }

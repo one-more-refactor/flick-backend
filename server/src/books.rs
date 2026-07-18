@@ -23,11 +23,31 @@ pub const UPLOAD_LIMIT: usize = 25 * 1024 * 1024;
 /// (CONTRACTS.md "Editions & plans").
 pub const WEEKLY_UPLOAD_LIMIT: i64 = 15;
 
+/// Whether the user currently enjoys Pro: paid plan, referral credit time,
+/// or a running global free_pro event (contract v0.7).
+pub async fn pro_active(state: &AppState, user: &db::User) -> Result<bool, AppError> {
+    if user.plan == "pro" {
+        return Ok(true);
+    }
+    let now = now_secs();
+    if user.pro_until > now {
+        return Ok(true);
+    }
+    if state.config.edition != Edition::Hosted {
+        return Ok(true); // selfhost: everything is unlimited anyway
+    }
+    let events = state
+        .db
+        .call(move |c| db::active_events(c, Some("free_pro"), now))
+        .await?;
+    Ok(!events.is_empty())
+}
+
 /// The user's weekly upload allowance — `Some(15)` only on the hosted
-/// edition's free plan (guests included); `None` = unlimited (selfhost
-/// edition, or pro).
-pub fn weekly_upload_limit(config: &Config, user: &db::User) -> Option<i64> {
-    (config.edition == Edition::Hosted && user.plan == "free").then_some(WEEKLY_UPLOAD_LIMIT)
+/// edition without active Pro; `None` = unlimited.
+pub fn weekly_upload_limit(config: &Config, user: &db::User, pro: bool) -> Option<i64> {
+    let _ = user;
+    (config.edition == Edition::Hosted && !pro).then_some(WEEKLY_UPLOAD_LIMIT)
 }
 
 const TITLE_CHARS: usize = 40;
@@ -248,7 +268,8 @@ async fn insert_prepared(
     };
     // Weekly limit (hosted free plan only): counted and enforced inside the
     // insert closure so check + insert are atomic under the one connection.
-    let limit = weekly_upload_limit(&state.config, user);
+    let pro = pro_active(state, user).await?;
+    let limit = weekly_upload_limit(&state.config, user, pro);
     let stored = book.clone();
     let user = user.clone();
     let inserted = state

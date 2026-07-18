@@ -182,6 +182,45 @@ fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .ok()
 }
 
+/// Infallible extractor: the request's client IP under the same trust rules
+/// as the rate limiter ("unknown" without ConnectInfo, e.g. in tests).
+pub struct ClientIp(pub String);
+
+impl<S> axum::extract::FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(ClientIp(client_ip(&parts.headers, peer)))
+    }
+}
+
+/// Client IP from headers + optional peer (signup attribution, referral
+/// anti-abuse). Same trust rules as the rate limiter.
+pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    match peer {
+        None => "unknown".into(),
+        Some(peer) => {
+            let peer_ip = peer.ip().to_canonical();
+            if trusted_proxy(peer_ip) {
+                if let Some(client) = forwarded_ip(headers) {
+                    return client.to_canonical().to_string();
+                }
+            }
+            peer_ip.to_string()
+        }
+    }
+}
+
 /// The rate-limit key for a request: the forwarded client IP when the direct
 /// peer is a trusted proxy, else the peer IP itself. Without `ConnectInfo`
 /// (router driven directly, e.g. `oneshot` in tests) the key is `"unknown"`

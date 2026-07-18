@@ -30,6 +30,7 @@ fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
         smtp_from: "flick <no-reply@localhost>".into(),
         dropbox_app_key: None,
         google_picker_api_key: None,
+        admin_token: Some("test-admin-token".into()),
     };
     let db = Db::open(&config.data_dir).expect("open db");
     let state = AppState::new(db, config);
@@ -65,6 +66,7 @@ fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::
         smtp_from: "flick <no-reply@localhost>".into(),
         dropbox_app_key: None,
         google_picker_api_key: None,
+        admin_token: Some("test-admin-token".into()),
     };
     mutate(&mut config);
     let db = Db::open(&config.data_dir).expect("open db");
@@ -1061,6 +1063,228 @@ async fn sessions_post_list_and_clamps() {
     let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
     assert_eq!(list[0]["book_title"], "DELETED");
     assert_eq!(list[1]["book_title"], "DELETED");
+}
+
+fn admin_request(method: &str, path: &str, body: Option<serde_json::Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", "Bearer test-admin-token");
+    let body = match body {
+        Some(v) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    builder.body(body).expect("request")
+}
+
+#[tokio::test]
+async fn referral_flow_with_admin_event() {
+    let (app, _dir) = test_app();
+
+    // Alice's invite status: code minted, no event running yet.
+    let alice = register(&app, "alice-ref@example.com").await;
+    let status =
+        body_json(send(&app, bare_request("GET", "/api/referral", Some(&alice))).await).await;
+    let code = status["code"].as_str().expect("code").to_string();
+    assert_eq!(status["path"], format!("/r/{code}"));
+    assert_eq!(status["invited"], 0);
+    assert!(status["event"].is_null());
+
+    // Admin API: wrong token 401, bad kind 400, then a running referral event.
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/admin/events")
+            .header("authorization", "Bearer wrong")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"kind": "referral", "title": "x", "starts_at": 0, "ends_at": 10})
+                    .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let resp = send(
+        &app,
+        admin_request(
+            "POST",
+            "/api/admin/events",
+            Some(json!({"kind": "nope", "title": "x", "starts_at": now, "ends_at": now + 10})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = send(
+        &app,
+        admin_request(
+            "POST",
+            "/api/admin/events",
+            Some(json!({
+                "kind": "referral",
+                "title": "Launch — bring a friend",
+                "starts_at": now - 60,
+                "ends_at": now + 86_400,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let event_id = body_json(resp).await["id"].as_str().expect("id").to_string();
+    let active =
+        body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
+    assert_eq!(active.as_array().map(Vec::len), Some(1));
+    assert_eq!(active[0]["kind"], "referral");
+
+    // Bob signs up through the link and reads on three (skew-valid) days.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "bob-ref@example.com", "password": "hunter22hunter22", "ref": code}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bob = session_cookie(&resp);
+    let status =
+        body_json(send(&app, bare_request("GET", "/api/referral", Some(&alice))).await).await;
+    assert_eq!(status["invited"], 1);
+    assert_eq!(status["pending"], 1);
+    assert_eq!(status["qualified"], 0);
+
+    let book = create_paste_book(&app, &bob, Some("Ref"), "Reading for the referral.").await;
+    let uri = format!("/api/books/{}/position", book["id"].as_str().expect("id"));
+    for offset in [-2i64, -1, 0] {
+        let resp = send(
+            &app,
+            json_request(
+                "PUT",
+                &uri,
+                Some(&bob),
+                json!({"position": 1, "read": 400, "day": flick_server::stats::utc_day(offset)}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // The sweep pays out both sides: 30 days of credit-based Pro each.
+    let status =
+        body_json(send(&app, bare_request("GET", "/api/referral", Some(&alice))).await).await;
+    assert_eq!(status["qualified"], 1);
+    assert_eq!(status["pending"], 0);
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&alice))).await).await;
+    assert_eq!(me["pro_active"], true);
+    assert!(me["pro_days"].as_i64().expect("days") >= 30);
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&bob))).await).await;
+    assert_eq!(me["pro_active"], true);
+
+    // Idempotent: a second sweep never double-pays.
+    let d1 = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&alice))).await).await
+        ["pro_days"]
+        .as_i64()
+        .expect("days");
+    let _ = send(&app, bare_request("GET", "/api/referral", Some(&alice))).await;
+    let d2 = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&alice))).await).await
+        ["pro_days"]
+        .as_i64()
+        .expect("days");
+    assert_eq!(d1, d2);
+
+    // Guests can't hold referral status; ending the event clears the banner.
+    let resp = send(&app, bare_request("POST", "/api/auth/guest", None)).await;
+    let guest = session_cookie(&resp);
+    let resp = send(&app, bare_request("GET", "/api/referral", Some(&guest))).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = send(
+        &app,
+        admin_request("DELETE", &format!("/api/admin/events/{event_id}"), None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let active =
+        body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
+    assert_eq!(active.as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn friends_scoreboard_and_wrapped() {
+    let (app, _dir) = test_app();
+    let alice = register(&app, "alice-soc@example.com").await;
+    let bob = register(&app, "bob-soc@example.com").await;
+
+    // Alice reads today so the scoreboard has numbers.
+    let book = create_paste_book(&app, &alice, Some("Soc"), "Words for the scoreboard.").await;
+    let uri = format!("/api/books/{}/position", book["id"].as_str().expect("id"));
+    let resp = send(
+        &app,
+        json_request("PUT", &uri, Some(&alice), json!({"position": 1, "read": 450})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Connect via Alice's friend link (same personal code).
+    let link = body_json(send(&app, bare_request("GET", "/api/friends/link", Some(&alice))).await)
+        .await;
+    let code = link["code"].as_str().expect("code").to_string();
+    let resp = send(
+        &app,
+        json_request("POST", "/api/friends/add", Some(&bob), json!({"code": code})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // Self-add 409, unknown 404.
+    let resp = send(
+        &app,
+        json_request("POST", "/api/friends/add", Some(&alice), json!({"code": code})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp = send(
+        &app,
+        json_request("POST", "/api/friends/add", Some(&bob), json!({"code": "nope"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bob's scoreboard: himself (me) + alice with her aggregate words.
+    let rows = body_json(send(&app, bare_request("GET", "/api/friends", Some(&bob))).await).await;
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["me"], true);
+    let alice_row = &rows[1];
+    assert_eq!(alice_row["me"], false);
+    assert_eq!(alice_row["week_words"], 450);
+    assert_eq!(alice_row["streak"], 1);
+
+    // Wrapped: alice's current year carries her words.
+    let wrapped =
+        body_json(send(&app, bare_request("GET", "/api/wrapped", Some(&alice))).await).await;
+    assert_eq!(wrapped["total_words"], 450);
+    assert_eq!(wrapped["active_days"], 1);
+    assert!(wrapped["best_day"]["words"].as_i64().expect("w") == 450);
+
+    // Unfriend from either side.
+    let alice_id = alice_row["id"].as_str().expect("id").to_string();
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/friends/{alice_id}"), Some(&bob)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let rows = body_json(send(&app, bare_request("GET", "/api/friends", Some(&bob))).await).await;
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
 }
 
 #[tokio::test]

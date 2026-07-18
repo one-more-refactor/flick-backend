@@ -95,7 +95,7 @@ pub(crate) fn parse_day(s: &str) -> Option<i64> {
 
 /// `(current, best)` from the ascending qualifying days (epoch days).
 /// Current = consecutive run ending today or yesterday.
-fn streaks(qualifying_asc: &[i64], today: i64) -> (i64, i64) {
+pub(crate) fn streaks(qualifying_asc: &[i64], today: i64) -> (i64, i64) {
     let mut best = 0i64;
     let mut run = 0i64;
     let mut prev: Option<i64> = None;
@@ -247,7 +247,8 @@ pub async fn list_sessions(
         .clamp(1, MAX_SESSIONS_LIMIT);
     // Reading-history window: hosted free plan sees the last 90 days only
     // (Pro and selfhost: everything). Server-side by design.
-    let min_started_at = if crate::books::weekly_upload_limit(&state.config, &user).is_some() {
+    let pro = crate::books::pro_active(&state, &user).await?;
+    let min_started_at = if crate::books::weekly_upload_limit(&state.config, &user, pro).is_some() {
         now_secs() - FREE_HISTORY_DAYS * 86_400
     } else {
         0

@@ -169,6 +169,31 @@ ALTER TABLE books ADD COLUMN share_token TEXT;
 CREATE UNIQUE INDEX books_share ON books(share_token);
 ";
 
+/// v0.7: referrals + credit-based Pro time, admin-run global events, and the
+/// social layer's friendships (single row per pair, `a < b`, auto-mutual).
+const SCHEMA_V8: &str = "
+ALTER TABLE users ADD COLUMN pro_until INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN ref_code TEXT;
+CREATE UNIQUE INDEX users_ref_code ON users(ref_code);
+ALTER TABLE users ADD COLUMN referred_by TEXT;
+ALTER TABLE users ADD COLUMN ref_credited INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN signup_ip TEXT;
+CREATE TABLE events (
+    id         TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    starts_at  INTEGER NOT NULL,
+    ends_at    INTEGER NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE friends (
+    a          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    b          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (a, b)
+);
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -225,6 +250,11 @@ impl Db {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V7}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 7)?;
         }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 8 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V8}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 8)?;
+        }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -271,6 +301,8 @@ pub struct User {
     pub accent: String,
     pub lang: String,
     pub plan: String,
+    /// Credit-based Pro time: epoch seconds until which Pro is active.
+    pub pro_until: i64,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -287,13 +319,14 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         accent: r.get(9)?,
         lang: r.get(10)?,
         plan: r.get(11)?,
+        pro_until: r.get(12)?,
     })
 }
 
-const USER_COLS: &str =
-    "id, email, name, password_hash, username, onboarded, wpm, theme, guest, accent, lang, plan";
+const USER_COLS: &str = "id, email, name, password_hash, username, onboarded, wpm, theme, \
+                         guest, accent, lang, plan, pro_until";
 const USER_COLS_U: &str = "u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, \
-                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan";
+                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan, u.pro_until";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -411,6 +444,16 @@ pub fn merge_guest_into(
         return Ok(());
     }
     let tx = c.unchecked_transaction()?;
+    // Referral attribution follows the person: a ref captured on the guest
+    // row moves to the account it merges into (once, never self).
+    tx.execute(
+        "UPDATE users SET
+            referred_by = COALESCE(referred_by,
+                (SELECT referred_by FROM users g WHERE g.id = ?1 AND g.referred_by != ?2)),
+            signup_ip = COALESCE(signup_ip, (SELECT signup_ip FROM users g WHERE g.id = ?1))
+         WHERE id = ?2",
+        params![guest_id, target_id],
+    )?;
     let target_intros: i64 = tx.query_row(
         "SELECT COUNT(*) FROM books WHERE user_id = ?1 AND source = 'intro'",
         [target_id],
@@ -1038,4 +1081,220 @@ pub fn catalog_cache_put(
         params![slug, timeline, word_count],
     )?;
     Ok(())
+}
+
+
+// ------------------------------------------------------- referrals (v0.7)
+
+/// Lazily mint (or return) the user's referral/friend code.
+pub fn ensure_ref_code(c: &Connection, user_id: &str, fresh: &str) -> rusqlite::Result<String> {
+    let existing: Option<Option<String>> = c
+        .query_row("SELECT ref_code FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+        .optional()?;
+    match existing.flatten() {
+        Some(code) => Ok(code),
+        None => {
+            c.execute(
+                "UPDATE users SET ref_code = ?2 WHERE id = ?1",
+                params![user_id, fresh],
+            )?;
+            Ok(fresh.to_string())
+        }
+    }
+}
+
+pub fn user_id_by_ref_code(c: &Connection, code: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row("SELECT id FROM users WHERE ref_code = ?1", [code], |r| r.get(0))
+        .optional()
+}
+
+/// Record who referred a fresh signup (once; never self).
+pub fn set_referred_by(
+    c: &Connection,
+    user_id: &str,
+    referrer_id: &str,
+    ip: &str,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET referred_by = ?2, signup_ip = ?3
+         WHERE id = ?1 AND referred_by IS NULL AND id != ?2",
+        params![user_id, referrer_id, ip],
+    )?;
+    Ok(())
+}
+
+/// One invitee row: (id, guest, ref_credited, signup_ip).
+pub type ReferralChild = (String, bool, i64, Option<String>);
+
+/// A referrer's invitees.
+pub fn referral_children(
+    c: &Connection,
+    user_id: &str,
+) -> rusqlite::Result<Vec<ReferralChild>> {
+    let mut stmt = c.prepare(
+        "SELECT id, guest, ref_credited, signup_ip FROM users WHERE referred_by = ?1",
+    )?;
+    let rows = stmt.query_map([user_id], |r| {
+        Ok((
+            r.get(0)?,
+            r.get::<_, i64>(1)? != 0,
+            r.get(2)?,
+            r.get(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+pub fn user_signup_ip(c: &Connection, user_id: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row("SELECT signup_ip FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+        .optional()
+        .map(Option::flatten)
+}
+
+/// Days on which the user hit the reading goal (referral qualification).
+pub fn qualifying_days(c: &Connection, user_id: &str, goal: i64) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM reading_days WHERE user_id = ?1 AND words >= ?2",
+        params![user_id, goal],
+        |r| r.get(0),
+    )
+}
+
+/// Extend credit-based Pro: `pro_until = max(pro_until, now) + days`.
+pub fn grant_pro_days(c: &Connection, user_id: &str, days: i64, now: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET pro_until = MAX(pro_until, ?3) + ?2 * 86400 WHERE id = ?1",
+        params![user_id, days, now],
+    )?;
+    Ok(())
+}
+
+pub fn set_ref_credited(c: &Connection, user_id: &str, v: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET ref_credited = ?2 WHERE id = ?1",
+        params![user_id, v],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------- events (v0.7)
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Event {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub payload: String,
+}
+
+pub fn insert_event(c: &Connection, e: &Event) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO events (id, kind, title, starts_at, ends_at, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![e.id, e.kind, e.title, e.starts_at, e.ends_at, e.payload],
+    )?;
+    Ok(())
+}
+
+pub fn delete_event(c: &Connection, id: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute("DELETE FROM events WHERE id = ?1", [id])? > 0)
+}
+
+pub fn list_events(c: &Connection) -> rusqlite::Result<Vec<Event>> {
+    let mut stmt =
+        c.prepare("SELECT id, kind, title, starts_at, ends_at, payload FROM events ORDER BY starts_at DESC")?;
+    let rows = stmt.query_map([], row_event)?;
+    rows.collect()
+}
+
+fn row_event(r: &Row) -> rusqlite::Result<Event> {
+    Ok(Event {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        title: r.get(2)?,
+        starts_at: r.get(3)?,
+        ends_at: r.get(4)?,
+        payload: r.get(5)?,
+    })
+}
+
+/// Currently running events, optionally filtered by kind.
+pub fn active_events(c: &Connection, kind: Option<&str>, now: i64) -> rusqlite::Result<Vec<Event>> {
+    let mut stmt = c.prepare(
+        "SELECT id, kind, title, starts_at, ends_at, payload FROM events
+         WHERE starts_at <= ?1 AND ends_at > ?1 AND (?2 IS NULL OR kind = ?2)
+         ORDER BY ends_at",
+    )?;
+    let rows = stmt.query_map(params![now, kind], row_event)?;
+    rows.collect()
+}
+
+// --------------------------------------------------------- friends (v0.7)
+
+/// Auto-mutual friendship; one row per pair with `a < b`.
+pub fn add_friend(c: &Connection, x: &str, y: &str, now: i64) -> rusqlite::Result<bool> {
+    if x == y {
+        return Ok(false);
+    }
+    let (a, b) = if x < y { (x, y) } else { (y, x) };
+    let n = c.execute(
+        "INSERT OR IGNORE INTO friends (a, b, created_at) VALUES (?1, ?2, ?3)",
+        params![a, b, now],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn remove_friend(c: &Connection, x: &str, y: &str) -> rusqlite::Result<bool> {
+    let (a, b) = if x < y { (x, y) } else { (y, x) };
+    Ok(c.execute("DELETE FROM friends WHERE a = ?1 AND b = ?2", params![a, b])? > 0)
+}
+
+pub fn friend_ids(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare(
+        "SELECT CASE WHEN a = ?1 THEN b ELSE a END FROM friends WHERE a = ?1 OR b = ?1",
+    )?;
+    let rows = stmt.query_map([user_id], |r| r.get(0))?;
+    rows.collect()
+}
+
+pub fn user_by_id(c: &Connection, id: &str) -> rusqlite::Result<Option<User>> {
+    c.query_row(
+        &format!("SELECT {USER_COLS} FROM users WHERE id = ?1"),
+        [id],
+        row_user,
+    )
+    .optional()
+}
+
+/// Books finished within [start, end) — for the yearly wrapped.
+pub fn books_finished_between(
+    c: &Connection,
+    user_id: &str,
+    start: i64,
+    end: i64,
+) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM books
+         WHERE user_id = ?1 AND word_count > 0 AND position >= word_count
+           AND deleted_at IS NULL AND last_read_at >= ?2 AND last_read_at < ?3",
+        params![user_id, start, end],
+        |r| r.get(0),
+    )
+}
+
+/// Session aggregates within [start, end): (count, time_ms, words).
+pub fn sessions_between(
+    c: &Connection,
+    user_id: &str,
+    start: i64,
+    end: i64,
+) -> rusqlite::Result<(i64, i64, i64)> {
+    c.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), COALESCE(SUM(words), 0)
+         FROM sessions_log WHERE user_id = ?1 AND started_at >= ?2 AND started_at < ?3",
+        params![user_id, start, end],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
 }

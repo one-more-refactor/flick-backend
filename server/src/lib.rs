@@ -14,6 +14,8 @@ pub mod integrations;
 pub mod mail;
 pub mod oidc;
 pub mod ratelimit;
+pub mod referral;
+pub mod social;
 pub mod stats;
 
 use std::sync::Arc;
@@ -154,6 +156,15 @@ fn api_router() -> Router<AppState> {
             "/sessions",
             get(stats::list_sessions).post(stats::create_session),
         )
+        .route("/referral", get(referral::status))
+        .route("/events/active", get(referral::active))
+        .route("/admin/events", get(referral::admin_list).post(referral::admin_create))
+        .route("/admin/events/{id}", delete(referral::admin_delete))
+        .route("/friends", get(social::list))
+        .route("/friends/link", get(social::link))
+        .route("/friends/add", post(social::add))
+        .route("/friends/{id}", delete(social::remove))
+        .route("/wrapped", get(social::wrapped))
         .route("/catalog", get(catalog::list))
         .route("/catalog/{slug}/add", post(catalog::add))
         .fallback(api_not_found)
