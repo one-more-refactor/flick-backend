@@ -1,21 +1,28 @@
-# flick — production image (backend + bundled web client).
+# flick — production image: the API server with the web client bundled in.
 #
-# Multi-stage: build the Svelte client with Bun, build the Rust server with
-# cargo, then assemble a slim Debian runtime that serves the API under /api and
-# the static web client at /. Native build — pick the host arch (arm64 on the
-# prod box, amd64 on CI). No cross-compile, no QEMU.
+# The Rust server is built from THIS repo; the Svelte client is fetched and
+# built from flick-web, then baked in so the server serves it at "/". The API
+# lives under /api. Native build — pick the host arch (arm64 on the prod box,
+# amd64 on CI). No cross-compile, no QEMU.
 #
-#   podman build -t flick-backend:latest -f deploy/Containerfile .
+#   podman build -t flick -f deploy/Containerfile .
+#   # pin the client:  --build-arg WEB_REF=v0.9.0
 
-# ---- web client ---------------------------------------------------------
+ARG WEB_REPO=https://github.com/one-more-refactor/flick-web
+ARG WEB_REF=master
+
+# ---- web client (built from flick-web) ----------------------------------
 FROM docker.io/oven/bun:1 AS web
+ARG WEB_REPO
+ARG WEB_REF
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /web
-COPY web/package.json web/bun.lock ./
+RUN git clone --depth 1 --branch "$WEB_REF" "$WEB_REPO" .
 RUN bun install --frozen-lockfile || bun install
-COPY web/ ./
 RUN bun run build
 
-# ---- server -------------------------------------------------------------
+# ---- server (built from this repo) --------------------------------------
 # rust:bookworm carries gcc, which rusqlite's bundled SQLite needs to compile.
 FROM docker.io/library/rust:1-bookworm AS server
 WORKDIR /src
@@ -33,7 +40,6 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=server /src/target/release/flick-server /usr/local/bin/flick-server
 COPY --from=web /web/dist /app/web/dist
-# Defaults; the Quadlet unit overrides edition / public URL / data dir.
 ENV FLICK_WEB_DIST=/app/web/dist \
     FLICK_DATA_DIR=/data \
     FLICK_ADDR=0.0.0.0:8484
