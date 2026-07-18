@@ -124,9 +124,14 @@ pub async fn stats(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> Result<Json<Value>, AppError> {
-    let days = state
+    let (days, totals) = state
         .db
-        .call(move |c| db::reading_days(c, &user.id))
+        .call(move |c| {
+            Ok::<_, rusqlite::Error>((
+                db::reading_days(c, &user.id)?,
+                db::stats_totals(c, &user.id)?,
+            ))
+        })
         .await?;
 
     let today_str = utc_day(0);
@@ -150,12 +155,28 @@ pub async fn stats(
         .map(|(day, words)| json!({"day": day, "words": words}))
         .collect();
 
+    // Duration-weighted lifetime average wpm from the session log.
+    let avg_wpm = if totals.time_ms > 0 {
+        (totals.session_words as f64 / (totals.time_ms as f64 / 60_000.0)).round() as i64
+    } else {
+        0
+    };
+
     Ok(Json(json!({
         "today": {"day": today_str, "words": today_words},
         "total_words": total_words,
         "goal": DAILY_GOAL,
         "streak": {"current": current, "best": best},
         "days": last,
+        "totals": {
+            "time_ms": totals.time_ms,
+            "sessions": totals.sessions,
+            "avg_wpm": avg_wpm,
+            "books_finished": totals.books_finished,
+            "active_days": totals.active_days,
+            "best_day": totals.best_day
+                .map(|(day, words)| json!({"day": day, "words": words})),
+        },
     })))
 }
 

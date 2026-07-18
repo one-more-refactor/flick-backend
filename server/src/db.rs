@@ -752,6 +752,53 @@ pub struct SessionLog {
     pub avg_wpm: i64,
 }
 
+/// Lifetime aggregates for GET /api/stats "totals" (contract v0.4.2).
+pub struct StatsTotals {
+    pub time_ms: i64,
+    pub sessions: i64,
+    pub session_words: i64,
+    pub books_finished: i64,
+    pub active_days: i64,
+    pub best_day: Option<(String, i64)>,
+}
+
+pub fn stats_totals(c: &Connection, user_id: &str) -> rusqlite::Result<StatsTotals> {
+    let (time_ms, sessions, session_words) = c.query_row(
+        "SELECT COALESCE(SUM(duration_ms), 0), COUNT(*), COALESCE(SUM(words), 0)
+         FROM sessions_log WHERE user_id = ?1",
+        [user_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let books_finished = c.query_row(
+        "SELECT COUNT(*) FROM books
+         WHERE user_id = ?1 AND word_count > 0 AND position >= word_count",
+        [user_id],
+        |r| r.get(0),
+    )?;
+    let active_days = c.query_row(
+        "SELECT COUNT(*) FROM reading_days WHERE user_id = ?1 AND words > 0",
+        [user_id],
+        |r| r.get(0),
+    )?;
+    let best_day = c
+        .query_row(
+            "SELECT day, words FROM reading_days
+             WHERE user_id = ?1 AND words > 0
+             ORDER BY words DESC, day DESC LIMIT 1",
+            [user_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(StatsTotals {
+        time_ms,
+        sessions,
+        session_words,
+        books_finished,
+        active_days,
+        best_day,
+    })
+}
+
 pub fn insert_session_log(
     c: &Connection,
     user_id: &str,

@@ -907,6 +907,14 @@ async fn stats_accumulate_and_streak() {
     assert_eq!(days[0]["words"], 400); // oldest first
     assert_eq!(days[1]["words"], 350);
 
+    // v0.4.2 totals: day-log aggregates live even with no sessions logged.
+    assert_eq!(stats["totals"]["time_ms"], 0);
+    assert_eq!(stats["totals"]["sessions"], 0);
+    assert_eq!(stats["totals"]["avg_wpm"], 0);
+    assert_eq!(stats["totals"]["active_days"], 2);
+    assert_eq!(stats["totals"]["best_day"]["words"], 400);
+    assert!(stats["totals"]["books_finished"].as_i64().expect("n") >= 0);
+
     // read is clamped to 500 per report.
     let resp = send(
         &app,
@@ -1011,6 +1019,13 @@ async fn sessions_post_list_and_clamps() {
     assert_eq!(list[0]["words"], 270000);
     assert_eq!(list[1]["book_title"], "Session Book");
     assert_eq!(list[1]["words"], 300);
+
+    // v0.4.2 stats totals aggregate the session log (duration-weighted wpm:
+    // (300 + 270000) words over 361 minutes = 748.75 → 749).
+    let stats = body_json(send(&app, bare_request("GET", "/api/stats", Some(&cookie))).await).await;
+    assert_eq!(stats["totals"]["sessions"], 2);
+    assert_eq!(stats["totals"]["time_ms"], 60_000 + 6 * 60 * 60 * 1000);
+    assert_eq!(stats["totals"]["avg_wpm"], 749);
 
     // Negative inputs are rejected outright.
     let resp = send(
