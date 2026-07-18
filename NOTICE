@@ -1,0 +1,13 @@
+flick — third-party data attributions
+
+Word-frequency tables (core/assets/freq_en.txt, core/assets/freq_de.txt)
+are derived from FrequencyWords by Hermit Dave
+(https://github.com/hermitdave/FrequencyWords — scripts MIT License,
+word-frequency content CC-BY-SA-4.0, Copyright (c) 2016 Hermit Dave;
+the derived tables here remain under CC-BY-SA-4.0), generated from the
+OpenSubtitles 2018 corpus (http://opus.nlpl.eu/OpenSubtitles2018.php).
+The tables here are truncated to the 20,000 most frequent words per
+language and annotated with quantized Zipf scores.
+
+Public-domain catalog texts (server/assets/catalog/) are sourced from
+Project Gutenberg and are in the public domain.

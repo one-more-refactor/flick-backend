@@ -349,9 +349,15 @@ async fn books_full_flow() {
     assert_eq!(timeline["word_count"], 7);
     let words = timeline["words"].as_array().expect("words");
     assert_eq!(words.len(), 7);
-    assert_eq!(words[0], json!(["Reading", 2, 1.0]));
-    assert_eq!(words[1], json!(["fast,", 1, 1.6]));
-    assert_eq!(words[3], json!(["fun.", 1, 2.6])); // paragraph dwell
+    // Engine v2: exact weights are model outputs — assert shape + ordering.
+    assert_eq!(words[0][0], "Reading");
+    assert_eq!(words[0][1], 2); // 7-char core pivots at index 2
+    assert_eq!(words[1][0], "fast,");
+    let plain = words[0][2].as_f64().expect("w");
+    let clause = words[1][2].as_f64().expect("w");
+    let para = words[3][2].as_f64().expect("w"); // "fun." ends the paragraph
+    let sentence = words[6][2].as_f64().expect("w"); // "here." ends the text
+    assert!(plain < clause && clause < sentence && sentence < para);
 
     // update position, visible in GET
     let resp = send(
