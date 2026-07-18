@@ -1238,6 +1238,7 @@ async fn friends_scoreboard_and_wrapped() {
     let link = body_json(send(&app, bare_request("GET", "/api/friends/link", Some(&alice))).await)
         .await;
     let code = link["code"].as_str().expect("code").to_string();
+    assert_eq!(code.len(), 32, "friend codes carry 128 bits as hex");
     let resp = send(
         &app,
         json_request("POST", "/api/friends/add", Some(&bob), json!({"code": code})),
@@ -1445,6 +1446,15 @@ async fn avatar_set_and_clear() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["avatar"], png);
 
+    // Active SVG content is rejected even when it is base64 encoded.
+    let svg = "data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+PC9zdmc+";
+    let resp = send(
+        &app,
+        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": svg })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // A non-data URL is rejected.
     let resp = send(
         &app,
@@ -1457,6 +1467,12 @@ async fn avatar_set_and_clear() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .expect("error")
+            .contains("PNG, JPEG, or WebP")
+    );
 
     // An empty string clears it back to null.
     let resp = send(
@@ -1882,12 +1898,26 @@ async fn import_url_rejects_private_and_local_addresses() {
         assert!(err.is_err(), "guard should reject {url}");
     }
 
-    // Public unicast passes the IP check; private/reserved fail it.
+    // Public unicast passes the IP check; private/reserved and IPv4-compatible
+    // IPv6 forms fail it.
     use std::net::IpAddr;
     for ip in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
         assert!(flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should be global");
     }
-    for ip in ["127.0.0.1", "10.0.0.1", "192.168.0.1", "169.254.0.1", "172.16.0.1", "100.64.0.1", "::1", "fe80::1", "fc00::1", "0.0.0.0"] {
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "192.168.0.1",
+        "169.254.0.1",
+        "172.16.0.1",
+        "100.64.0.1",
+        "::1",
+        "::127.0.0.1",
+        "::169.254.169.254",
+        "fe80::1",
+        "fc00::1",
+        "0.0.0.0",
+    ] {
         assert!(!flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should NOT be global");
     }
 
@@ -2222,6 +2252,41 @@ async fn rate_limit_429_shape_and_unrelated_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     // And registering still works while login is exhausted.
     register(&app, "unaffected@example.com").await;
+}
+
+#[tokio::test]
+async fn friend_add_is_rate_limited() {
+    let limits = RateLimits {
+        friend_add: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+    let cookie = register(&app, "friend-limit@example.com").await;
+
+    for _ in 0..2 {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/friends/add",
+                Some(&cookie),
+                json!({"code": "unknown"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/friends/add",
+            Some(&cookie),
+            json!({"code": "unknown"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

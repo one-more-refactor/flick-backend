@@ -619,14 +619,19 @@ pub struct MePatch {
     settings: Option<SettingsPatch>,
 }
 
-/// A profile picture must be a small, self-contained `data:` image URL. Cap the
-/// stored size (~150 KB of base64) so the DB and every `user_json` stay light.
+/// A profile picture must be a small, self-contained raster `data:` image URL.
+/// Cap the stored size so the DB and every `user_json` stay light.
 const MAX_AVATAR_LEN: usize = 200_000;
 
 fn valid_avatar(data: &str) -> bool {
     data.len() <= MAX_AVATAR_LEN
-        && data.starts_with("data:image/")
-        && data.contains(";base64,")
+        && [
+            "data:image/png;base64,",
+            "data:image/jpeg;base64,",
+            "data:image/webp;base64,",
+        ]
+        .iter()
+        .any(|prefix| data.starts_with(prefix))
 }
 
 fn valid_username(u: &str) -> bool {
@@ -666,7 +671,7 @@ pub async fn update_me(
             user.avatar = Some(avatar);
         } else {
             return Err(AppError::bad_request(
-                "avatar must be a data:image URL under 150 KB",
+                "avatar must be a PNG, JPEG, or WebP data URL under 150 KB",
             ));
         }
     }

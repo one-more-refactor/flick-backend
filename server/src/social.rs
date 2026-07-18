@@ -27,7 +27,7 @@ pub async fn link(
             "create an account first — friends need somewhere to stick".into(),
         ));
     }
-    let fresh = random_token(8);
+    let fresh = random_token(16);
     let uid = user.id.clone();
     let code = state
         .db
