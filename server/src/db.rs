@@ -398,6 +398,82 @@ pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// GDPR erasure (Art. 17): remove the account and everything it owns. FK
+/// cascades take sessions, books (+ the FTS index via its delete trigger),
+/// identities, reading_days, sessions_log and friend rows; `login_codes` are
+/// keyed by email, so clear them explicitly. Referrer back-references
+/// (`users.referred_by`) are plain text and simply go stale.
+pub fn delete_user(c: &Connection, user_id: &str, email: Option<&str>) -> rusqlite::Result<()> {
+    if let Some(e) = email {
+        c.execute("DELETE FROM login_codes WHERE email = ?1", [e])?;
+    }
+    c.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+    Ok(())
+}
+
+/// GDPR access + portability (Art. 15/20): a machine-readable dump of
+/// everything tied to this account — profile, library (incl. the source text),
+/// reading days, session log, and the user's own friend list. No other user's
+/// data is included.
+pub fn export_user(c: &Connection, user: &User) -> rusqlite::Result<serde_json::Value> {
+    let created_at: i64 = c
+        .query_row("SELECT created_at FROM users WHERE id = ?1", [&user.id], |r| r.get(0))
+        .unwrap_or(0);
+
+    let mut books = Vec::new();
+    for b in list_books(c, &user.id)? {
+        let text = book_text(c, &user.id, &b.id)?;
+        books.push(serde_json::json!({
+            "id": b.id, "title": b.title, "author": b.author, "source": b.source,
+            "word_count": b.word_count, "position": b.position,
+            "created_at": b.created_at, "last_read_at": b.last_read_at,
+            "url": b.url, "category": b.category, "tags": b.tags, "text": text,
+        }));
+    }
+
+    let days: Vec<serde_json::Value> = reading_days(c, &user.id)?
+        .into_iter()
+        .map(|(day, words)| serde_json::json!({ "day": day, "words": words }))
+        .collect();
+
+    let sessions: Vec<serde_json::Value> = list_sessions_log(c, &user.id, 1_000_000, 0)?
+        .into_iter()
+        .map(|(s, title)| {
+            serde_json::json!({
+                "id": s.id, "book_id": s.book_id, "book_title": title,
+                "started_at": s.started_at, "duration_ms": s.duration_ms,
+                "words": s.words, "avg_wpm": s.avg_wpm,
+            })
+        })
+        .collect();
+
+    let mut friends = Vec::new();
+    for fid in friend_ids(c, &user.id)? {
+        if let Some(f) = user_by_id(c, &fid)? {
+            friends.push(serde_json::json!({
+                "id": f.id, "name": f.username.unwrap_or(f.name),
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "exported_at": now_secs(),
+        "account": {
+            "id": user.id, "email": user.email, "name": user.name,
+            "username": user.username, "created_at": created_at,
+            "plan": user.plan, "pro_until": user.pro_until,
+            "settings": {
+                "wpm": user.wpm, "theme": user.theme,
+                "accent": user.accent, "lang": user.lang,
+            },
+        },
+        "books": books,
+        "reading_days": days,
+        "sessions": sessions,
+        "friends": friends,
+    }))
+}
+
 // ------------------------------------------------------------ identities
 
 pub fn user_by_identity(

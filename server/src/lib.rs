@@ -124,7 +124,11 @@ fn api_router() -> Router<AppState> {
         .route("/auth/code/request", post(auth::code_request))
         .route("/auth/code/verify", post(auth::code_verify))
         .route("/auth/logout", post(auth::logout))
-        .route("/auth/me", get(auth::me).patch(auth::update_me))
+        .route(
+            "/auth/me",
+            get(auth::me).patch(auth::update_me).delete(auth::delete_me),
+        )
+        .route("/auth/export", get(auth::export_me))
         .route("/auth/providers", get(auth::providers))
         .route("/auth/oauth/{provider}/login", get(oidc::login))
         .route("/auth/oauth/{provider}/callback", get(oidc::callback))

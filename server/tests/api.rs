@@ -1469,6 +1469,36 @@ async fn avatar_set_and_clear() {
 }
 
 #[tokio::test]
+async fn account_export_and_delete() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "erase@example.com").await;
+    create_paste_book(&app, &cookie, Some("My Notes"), "Some private words to export.").await;
+
+    // GDPR export: the account + the book's source text come back.
+    let resp = send(&app, bare_request("GET", "/api/auth/export", Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let dump = body_json(resp).await;
+    assert_eq!(dump["account"]["email"], "erase@example.com");
+    let books = dump["books"].as_array().expect("books");
+    assert!(books.iter().any(|b| {
+        b["title"] == "My Notes"
+            && b["text"].as_str().unwrap_or_default().contains("private words")
+    }));
+
+    // GDPR erasure: account gone, session cleared, email free again.
+    let resp = send(&app, bare_request("DELETE", "/api/auth/me", Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/lookup", None, json!({ "email": "erase@example.com" })),
+    )
+    .await;
+    assert_eq!(body_json(resp).await["exists"], false);
+}
+
+#[tokio::test]
 async fn free_hosted_history_window() {
     // Hosted free plan: sessions older than 90 days vanish from the list
     // (server-side history window, contract v0.6). Selfhost keeps everything.

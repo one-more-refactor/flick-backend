@@ -67,6 +67,18 @@ fn sha256_hex(input: &str) -> String {
         .collect()
 }
 
+/// Pseudonymize a client IP before storing it for referral same-IP dedup, so
+/// no raw IP address (personal data) is retained. `"unknown"` (unattributable)
+/// is kept verbatim so the dedup can skip it. Both sides of a comparison are
+/// stored the same way, so hashing is transparent to the dedup check.
+fn hash_ip(ip: &str) -> String {
+    if ip == "unknown" {
+        ip.to_string()
+    } else {
+        sha256_hex(&format!("flick-ip-v1:{ip}"))
+    }
+}
+
 /// Constant-time equality so code verification can't be timed byte-by-byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -261,7 +273,7 @@ pub async fn guest(
         .ok()
         .and_then(|b| b.ref_code)
         .filter(|c| !c.is_empty());
-    let ip = ip.0;
+    let ip = hash_ip(&ip.0);
     state
         .db
         .call(move |c| {
@@ -445,7 +457,7 @@ pub async fn register(
     let user = new_user(Some(email), name, Some(password_hash), false);
     let now = now_secs();
     let ref_code = body_ref.filter(|c| !c.is_empty());
-    let ip = ip.0;
+    let ip = hash_ip(&ip.0);
     let inserted = state
         .db
         .call({
@@ -543,6 +555,49 @@ pub async fn me(
     AuthUser(user): AuthUser,
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(user_json(&state, &user).await?))
+}
+
+/// GET /api/auth/export — a full JSON download of the caller's own data
+/// (GDPR access/portability). Streams as an attachment.
+pub async fn export_me(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<Response, AppError> {
+    let u = user.clone();
+    let data = state.db.call(move |c| db::export_user(c, &u)).await?;
+    let body = serde_json::to_vec_pretty(&data).map_err(AppError::internal)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"flick-export.json\"",
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// DELETE /api/auth/me — permanently erase the account and everything it owns
+/// (GDPR erasure), then clear the session cookie. Irreversible.
+pub async fn delete_me(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<Response, AppError> {
+    let email = user.email.clone();
+    let uid = user.id.clone();
+    state
+        .db
+        .call(move |c| db::delete_user(c, &uid, email.as_deref()))
+        .await?;
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_session_cookie(state.config.cookie_secure()))
+            .map_err(AppError::internal)?,
+    );
+    Ok(resp)
 }
 
 #[derive(Deserialize)]
