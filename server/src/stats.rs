@@ -28,6 +28,9 @@ const MAX_SESSION_MS: i64 = 6 * 60 * 60 * 1000; // 6h
 const MAX_AVG_WPM: i64 = 1500;
 const DEFAULT_SESSIONS_LIMIT: i64 = 50;
 const MAX_SESSIONS_LIMIT: i64 = 200;
+/// Free hosted accounts keep this much session history (contract: Pro =
+/// unlimited reading history; enforced server-side so clients can't cheat).
+pub const FREE_HISTORY_DAYS: i64 = 90;
 
 // ------------------------------------------------------------ day math
 // Howard Hinnant's civil-date algorithms (proleptic Gregorian).
@@ -242,9 +245,16 @@ pub async fn list_sessions(
         .limit
         .unwrap_or(DEFAULT_SESSIONS_LIMIT)
         .clamp(1, MAX_SESSIONS_LIMIT);
+    // Reading-history window: hosted free plan sees the last 90 days only
+    // (Pro and selfhost: everything). Server-side by design.
+    let min_started_at = if crate::books::weekly_upload_limit(&state.config, &user).is_some() {
+        now_secs() - FREE_HISTORY_DAYS * 86_400
+    } else {
+        0
+    };
     let rows = state
         .db
-        .call(move |c| db::list_sessions_log(c, &user.id, limit))
+        .call(move |c| db::list_sessions_log(c, &user.id, limit, min_started_at))
         .await?;
     let sessions: Vec<Value> = rows
         .into_iter()

@@ -162,6 +162,13 @@ ALTER TABLE books ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
 CREATE INDEX books_trash ON books(user_id, deleted_at);
 ";
 
+/// v0.6: public share links — a nullable unique token per book (multiple
+/// NULLs are fine in SQLite unique indexes).
+const SCHEMA_V7: &str = "
+ALTER TABLE books ADD COLUMN share_token TEXT;
+CREATE UNIQUE INDEX books_share ON books(share_token);
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -212,6 +219,11 @@ impl Db {
         if version < 6 {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V6}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 6)?;
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 7 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V7}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 7)?;
         }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -682,7 +694,7 @@ pub fn uploads_this_week(c: &Connection, user_id: &str, now: i64) -> rusqlite::R
     c.query_row(
         "SELECT COUNT(*) FROM books
          WHERE user_id = ?1 AND created_at >= ?2 AND deleted_at IS NULL
-           AND source NOT IN ('intro', 'catalog')",
+           AND source NOT IN ('intro', 'catalog', 'shared')",
         params![user_id, iso_week_start(now)],
         |r| r.get(0),
     )
@@ -776,6 +788,78 @@ pub fn list_trash(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<(Book, 
     ))?;
     let rows = stmt.query_map([user_id], |r| Ok((row_book(r)?, r.get(13)?)))?;
     rows.collect()
+}
+
+/// Set (or keep) a live book's share token. Returns the active token, or
+/// None when the book is missing/trashed.
+pub fn ensure_share_token(
+    c: &Connection,
+    user_id: &str,
+    id: &str,
+    fresh: &str,
+) -> rusqlite::Result<Option<String>> {
+    let existing: Option<Option<String>> = c
+        .query_row(
+            "SELECT share_token FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+            params![id, user_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match existing {
+        None => Ok(None),
+        Some(Some(token)) => Ok(Some(token)),
+        Some(None) => {
+            c.execute(
+                "UPDATE books SET share_token = ?3 WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id, fresh],
+            )?;
+            Ok(Some(fresh.to_string()))
+        }
+    }
+}
+
+/// Revoke a book's share link. False when the book has none / isn't yours.
+pub fn clear_share_token(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<bool> {
+    let n = c.execute(
+        "UPDATE books SET share_token = NULL
+         WHERE id = ?1 AND user_id = ?2 AND share_token IS NOT NULL",
+        params![id, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Resolve a public share token to (owner_id, book) — live books only.
+pub fn book_by_share_token(
+    c: &Connection,
+    token: &str,
+) -> rusqlite::Result<Option<(String, Book)>> {
+    c.query_row(
+        &format!(
+            "SELECT user_id, {BOOK_COLS} FROM books
+             WHERE share_token = ?1 AND deleted_at IS NULL"
+        ),
+        [token],
+        |r| {
+            let owner: String = r.get(0)?;
+            let book = Book {
+                id: r.get(1)?,
+                title: r.get(2)?,
+                source: r.get(3)?,
+                word_count: r.get(4)?,
+                position: r.get(5)?,
+                created_at: r.get(6)?,
+                last_read_at: r.get(7)?,
+                author: r.get(8)?,
+                url: r.get(9)?,
+                favicon: r.get(10)?,
+                excerpt: r.get(11)?,
+                category: r.get(12)?,
+                tags: serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default(),
+            };
+            Ok((owner, book))
+        },
+    )
+    .optional()
 }
 
 /// Replace a live book's tags (already validated + serialized by the caller).
@@ -893,16 +977,17 @@ pub fn list_sessions_log(
     c: &Connection,
     user_id: &str,
     limit: i64,
+    min_started_at: i64,
 ) -> rusqlite::Result<Vec<(SessionLog, Option<String>)>> {
     let mut stmt = c.prepare(
         "SELECT s.id, s.book_id, s.started_at, s.duration_ms, s.words, s.avg_wpm, b.title
          FROM sessions_log s
          LEFT JOIN books b ON b.id = s.book_id AND b.user_id = s.user_id
-         WHERE s.user_id = ?1
+         WHERE s.user_id = ?1 AND s.started_at >= ?3
          ORDER BY s.started_at DESC, s.id
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![user_id, limit], |r| {
+    let rows = stmt.query_map(params![user_id, limit, min_started_at], |r| {
         Ok((
             SessionLog {
                 id: r.get(0)?,

@@ -1,6 +1,6 @@
 [package]
 name = "flick-core"
-version = "0.5.1"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 description = "flick reading engine: text -> ORP-pivoted, weight-timed reading timeline"

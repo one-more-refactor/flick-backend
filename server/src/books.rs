@@ -714,6 +714,101 @@ pub async fn purge_book(
     }
 }
 
+// ---------------------------------------------------------- share links
+
+/// POST /api/books/{id}/share — mint (or return the existing) public share
+/// token for a live book (contract v0.6). Idempotent.
+pub async fn share_book(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let fresh = random_token(12);
+    let token = state
+        .db
+        .call(move |c| db::ensure_share_token(c, &user.id, &id, &fresh))
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(json!({ "token": token, "path": format!("/s/{token}") })))
+}
+
+/// DELETE /api/books/{id}/share — revoke the share link (204/404).
+pub async fn unshare_book(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(id): AppPath<String>,
+) -> Result<StatusCode, AppError> {
+    let cleared = state
+        .db
+        .call(move |c| db::clear_share_token(c, &user.id, &id))
+        .await?;
+    if cleared {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// GET /api/shared/{token} — public preview of a shared book (no auth).
+pub async fn shared_info(
+    State(state): State<AppState>,
+    AppPath(token): AppPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let (_, book) = state
+        .db
+        .call(move |c| db::book_by_share_token(c, &token))
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(json!({
+        "title": book.title,
+        "author": book.author,
+        "word_count": book.word_count,
+        "category": book.category,
+    })))
+}
+
+/// POST /api/shared/{token}/import — copy a shared book into the caller's
+/// library (`source: "shared"`, never counts toward upload limits). A copy
+/// that already exists (same share origin, matched by title+word_count) is
+/// simply returned again.
+pub async fn shared_import(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppPath(token): AppPath<String>,
+) -> Result<Response, AppError> {
+    let now = now_secs();
+    let book = state
+        .db
+        .call(move |c| {
+            let Some((owner_id, src)) = db::book_by_share_token(c, &token)? else {
+                return Ok(None);
+            };
+            let timeline = db::get_timeline(c, &owner_id, &src.id)?
+                .expect("shared book has a timeline");
+            let text = db::book_text(c, &owner_id, &src.id)?;
+            let copy = Book {
+                id: random_token(16),
+                title: src.title.clone(),
+                source: "shared".into(),
+                word_count: src.word_count,
+                position: 0,
+                created_at: now,
+                last_read_at: None,
+                author: src.author.clone(),
+                url: src.url.clone(),
+                favicon: None,
+                excerpt: src.excerpt.clone(),
+                category: src.category.clone(),
+                tags: src.tags.clone(),
+            };
+            db::insert_book(c, &user.id, &copy, &timeline, text.as_deref(), None)?;
+            Ok(Some(copy))
+        })
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok((StatusCode::CREATED, Json(book)).into_response())
+}
+
 #[derive(Deserialize)]
 pub struct TagsBody {
     tags: Vec<String>,

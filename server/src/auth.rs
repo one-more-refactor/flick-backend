@@ -117,6 +117,7 @@ pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError>
         "username": user.username,
         "guest": user.guest,
         "onboarded": user.onboarded,
+        "plan": user.plan,
         "settings": {
             "wpm": user.wpm,
             "theme": user.theme,

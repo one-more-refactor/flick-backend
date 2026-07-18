@@ -133,6 +133,12 @@ fn api_router() -> Router<AppState> {
         .route("/books/{id}/restore", post(books::restore_book))
         .route("/books/{id}/purge", delete(books::purge_book))
         .route("/books/{id}/tags", put(books::set_tags))
+        .route(
+            "/books/{id}/share",
+            post(books::share_book).delete(books::unshare_book),
+        )
+        .route("/shared/{token}", get(books::shared_info))
+        .route("/shared/{token}/import", post(books::shared_import))
         .route("/import/url", post(books::import_url))
         .route("/import/html", post(books::import_html))
         .route(

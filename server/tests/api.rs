@@ -1064,6 +1064,112 @@ async fn sessions_post_list_and_clamps() {
 }
 
 #[tokio::test]
+async fn share_link_flow() {
+    let (app, _dir) = test_app();
+    let alice = register(&app, "sharer@example.com").await;
+    let book = create_paste_book(&app, &alice, Some("Shared Words"), "Words worth passing on.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+
+    // Mint a share link; a second mint returns the same token (idempotent).
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/books/{id}/share"), Some(&alice)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let share = body_json(resp).await;
+    let token = share["token"].as_str().expect("token").to_string();
+    assert_eq!(share["path"], format!("/s/{token}"));
+    let again = body_json(
+        send(&app, bare_request("POST", &format!("/api/books/{id}/share"), Some(&alice))).await,
+    )
+    .await;
+    assert_eq!(again["token"], token.as_str());
+
+    // Public preview needs no auth.
+    let resp = send(&app, bare_request("GET", &format!("/api/shared/{token}"), None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = body_json(resp).await;
+    assert_eq!(info["title"], "Shared Words");
+    assert!(info["word_count"].as_i64().expect("wc") > 0);
+
+    // Bob imports the copy: his own book, source "shared", position 0 —
+    // and it does NOT touch his upload allowance.
+    let bob = register(&app, "recipient@example.com").await;
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/shared/{token}/import"), Some(&bob)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let copy = body_json(resp).await;
+    assert_eq!(copy["source"], "shared");
+    assert_eq!(copy["title"], "Shared Words");
+    let copy_id = copy["id"].as_str().expect("id");
+    let tl = body_json(
+        send(&app, bare_request("GET", &format!("/api/books/{copy_id}/timeline"), Some(&bob)))
+            .await,
+    )
+    .await;
+    assert_eq!(tl["version"], 1);
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&bob))).await).await;
+    assert_eq!(me["uploads"]["used"], 0);
+    assert_eq!(me["plan"], "free");
+
+    // Revoke: preview and import turn into 404s; unknown tokens too.
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}/share"), Some(&alice)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    for req in [
+        bare_request("GET", &format!("/api/shared/{token}"), None),
+        bare_request("POST", &format!("/api/shared/{token}/import"), Some(&bob)),
+        bare_request("GET", "/api/shared/nope", None),
+    ] {
+        let resp = send(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn free_hosted_history_window() {
+    // Hosted free plan: sessions older than 90 days vanish from the list
+    // (server-side history window, contract v0.6). Selfhost keeps everything.
+    for (hosted, expect) in [(true, 1), (false, 2)] {
+        let (app, _dir) = if hosted {
+            test_app_with_config(|c| c.edition = Edition::Hosted)
+        } else {
+            test_app()
+        };
+        let cookie = register(&app, "history@example.com").await;
+        let book = create_paste_book(&app, &cookie, Some("H"), "History window words.").await;
+        let id = book["id"].as_str().expect("id").to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        for started in [now - 200 * 86_400, now - 3600] {
+            let resp = send(
+                &app,
+                json_request(
+                    "POST",
+                    "/api/sessions",
+                    Some(&cookie),
+                    json!({"book_id": id, "started_at": started, "duration_ms": 60000, "words": 300, "avg_wpm": 300}),
+                ),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let list =
+            body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
+        assert_eq!(list.as_array().map(Vec::len), Some(expect), "hosted={hosted}");
+    }
+}
+
+#[tokio::test]
 async fn trash_restore_purge_and_tags() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "trash@example.com").await;
