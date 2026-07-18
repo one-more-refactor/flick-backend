@@ -737,20 +737,37 @@ pub async fn purge_book(
 
 // ---------------------------------------------------------- share links
 
+/// Optional `{"mode": "import" | "read"}` body on POST share.
+#[derive(Deserialize, Default)]
+pub struct ShareBody {
+    mode: Option<String>,
+}
+
 /// POST /api/books/{id}/share — mint (or return the existing) public share
-/// token for a live book (contract v0.6). Idempotent.
+/// token for a live book and set its permission mode (contract v0.6/v0.8).
+/// Idempotent; re-posting with a different mode flips read-only ↔ importable.
 pub async fn share_book(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     AppPath(id): AppPath<String>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
+    // Absent/blank body defaults to the copy-into-library behaviour.
+    let mode = serde_json::from_slice::<ShareBody>(&body)
+        .ok()
+        .and_then(|b| b.mode)
+        .filter(|m| m == "read" || m == "import")
+        .unwrap_or_else(|| "import".into());
     let fresh = random_token(12);
+    let mode_stored = mode.clone();
     let token = state
         .db
-        .call(move |c| db::ensure_share_token(c, &user.id, &id, &fresh))
+        .call(move |c| db::ensure_share_token(c, &user.id, &id, &fresh, &mode_stored))
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(json!({ "token": token, "path": format!("/s/{token}") })))
+    Ok(Json(
+        json!({ "token": token, "path": format!("/s/{token}"), "mode": mode }),
+    ))
 }
 
 /// DELETE /api/books/{id}/share — revoke the share link (204/404).
@@ -771,11 +788,12 @@ pub async fn unshare_book(
 }
 
 /// GET /api/shared/{token} — public preview of a shared book (no auth).
+/// `mode` tells the client whether the recipient may import it or only read it.
 pub async fn shared_info(
     State(state): State<AppState>,
     AppPath(token): AppPath<String>,
 ) -> Result<Json<Value>, AppError> {
-    let (_, book) = state
+    let (_, book, mode) = state
         .db
         .call(move |c| db::book_by_share_token(c, &token))
         .await?
@@ -785,7 +803,28 @@ pub async fn shared_info(
         "author": book.author,
         "word_count": book.word_count,
         "category": book.category,
+        "mode": mode,
     })))
+}
+
+/// GET /api/shared/{token}/timeline — the playable timeline behind a share
+/// link, for read-only recipients (no library copy, no auth required). Serves
+/// the stored JSON blob verbatim, exactly like the authed timeline endpoint.
+pub async fn shared_timeline(
+    State(state): State<AppState>,
+    AppPath(token): AppPath<String>,
+) -> Result<Response, AppError> {
+    let blob = state
+        .db
+        .call(move |c| {
+            let Some((owner_id, src, _mode)) = db::book_by_share_token(c, &token)? else {
+                return Ok(None);
+            };
+            db::get_timeline(c, &owner_id, &src.id)
+        })
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], blob).into_response())
 }
 
 /// POST /api/shared/{token}/import — copy a shared book into the caller's
@@ -798,12 +837,17 @@ pub async fn shared_import(
     AppPath(token): AppPath<String>,
 ) -> Result<Response, AppError> {
     let now = now_secs();
-    let book = state
+    // Outcome: None = no such link; Some(Err) = read-only (no copy allowed);
+    // Some(Ok) = the imported copy.
+    let outcome = state
         .db
         .call(move |c| {
-            let Some((owner_id, src)) = db::book_by_share_token(c, &token)? else {
+            let Some((owner_id, src, mode)) = db::book_by_share_token(c, &token)? else {
                 return Ok(None);
             };
+            if mode == "read" {
+                return Ok(Some(Err(())));
+            }
             let timeline = db::get_timeline(c, &owner_id, &src.id)?
                 .expect("shared book has a timeline");
             let text = db::book_text(c, &owner_id, &src.id)?;
@@ -823,11 +867,18 @@ pub async fn shared_import(
                 tags: src.tags.clone(),
             };
             db::insert_book(c, &user.id, &copy, &timeline, text.as_deref(), None)?;
-            Ok(Some(copy))
+            Ok(Some(Ok(copy)))
         })
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok((StatusCode::CREATED, Json(book)).into_response())
+        .await?;
+    match outcome {
+        None => Err(AppError::NotFound),
+        Some(Err(())) => Err(AppError::Coded(
+            StatusCode::FORBIDDEN,
+            "this share link is read-only".into(),
+            "read_only",
+        )),
+        Some(Ok(book)) => Ok((StatusCode::CREATED, Json(book)).into_response()),
+    }
 }
 
 #[derive(Deserialize)]

@@ -1358,6 +1358,117 @@ async fn share_link_flow() {
 }
 
 #[tokio::test]
+async fn share_read_only_mode() {
+    let (app, _dir) = test_app();
+    let alice = register(&app, "readonly-owner@example.com").await;
+    let book = create_paste_book(&app, &alice, Some("Read Only"), "You may read but not keep.").await;
+    let id = book["id"].as_str().expect("id").to_string();
+
+    // Share as read-only.
+    let share = body_json(
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/books/{id}/share"),
+                Some(&alice),
+                json!({ "mode": "read" }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(share["mode"], "read");
+    let token = share["token"].as_str().expect("token").to_string();
+
+    // Public preview advertises the mode; the timeline is publicly playable.
+    let info = body_json(send(&app, bare_request("GET", &format!("/api/shared/{token}"), None)).await)
+        .await;
+    assert_eq!(info["mode"], "read");
+    let resp = send(
+        &app,
+        bare_request("GET", &format!("/api/shared/{token}/timeline"), None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tl = body_json(resp).await;
+    assert_eq!(tl["version"], 1);
+    assert!(!tl["words"].as_array().expect("words").is_empty());
+
+    // Importing a read-only share is forbidden with a machine-readable code.
+    let bob = register(&app, "readonly-recipient@example.com").await;
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/shared/{token}/import"), Some(&bob)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let err = body_json(resp).await;
+    assert_eq!(err["code"], "read_only");
+
+    // Flipping the same link back to importable lets the copy through.
+    let flipped = body_json(
+        send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/books/{id}/share"),
+                Some(&alice),
+                json!({ "mode": "import" }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(flipped["token"], token.as_str()); // same token, new mode
+    let resp = send(
+        &app,
+        bare_request("POST", &format!("/api/shared/{token}/import"), Some(&bob)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["source"], "shared");
+}
+
+#[tokio::test]
+async fn avatar_set_and_clear() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "avatar@example.com").await;
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    // Set a valid data:image avatar — it comes back on the user object.
+    let resp = send(
+        &app,
+        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": png })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["avatar"], png);
+
+    // A non-data URL is rejected.
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "avatar": "https://example.com/pic.png" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // An empty string clears it back to null.
+    let resp = send(
+        &app,
+        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": "" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["avatar"].is_null());
+}
+
+#[tokio::test]
 async fn free_hosted_history_window() {
     // Hosted free plan: sessions older than 90 days vanish from the list
     // (server-side history window, contract v0.6). Selfhost keeps everything.

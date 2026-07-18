@@ -126,6 +126,7 @@ pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError>
         "plan": user.plan,
         "pro_active": pro,
         "pro_days": pro_days,
+        "avatar": user.avatar,
         "settings": {
             "wpm": user.wpm,
             "theme": user.theme,
@@ -158,6 +159,7 @@ pub fn new_user(
         lang: "auto".into(),
         plan: "free".into(),
         pro_until: 0,
+        avatar: None,
     }
 }
 
@@ -556,7 +558,20 @@ pub struct MePatch {
     username: Option<String>,
     name: Option<String>,
     onboarded: Option<bool>,
+    /// Square profile picture: a `data:image/...;base64,...` URL to set, or an
+    /// empty string to clear it. Absent = unchanged.
+    avatar: Option<String>,
     settings: Option<SettingsPatch>,
+}
+
+/// A profile picture must be a small, self-contained `data:` image URL. Cap the
+/// stored size (~150 KB of base64) so the DB and every `user_json` stay light.
+const MAX_AVATAR_LEN: usize = 200_000;
+
+fn valid_avatar(data: &str) -> bool {
+    data.len() <= MAX_AVATAR_LEN
+        && data.starts_with("data:image/")
+        && data.contains(";base64,")
 }
 
 fn valid_username(u: &str) -> bool {
@@ -589,6 +604,17 @@ pub async fn update_me(
     if let Some(onboarded) = patch.onboarded {
         user.onboarded = onboarded;
     }
+    if let Some(avatar) = patch.avatar {
+        if avatar.is_empty() {
+            user.avatar = None; // explicit clear
+        } else if valid_avatar(&avatar) {
+            user.avatar = Some(avatar);
+        } else {
+            return Err(AppError::bad_request(
+                "avatar must be a data:image URL under 150 KB",
+            ));
+        }
+    }
     if let Some(settings) = patch.settings {
         if let Some(wpm) = settings.wpm {
             if !(100..=1200).contains(&wpm) {
@@ -614,8 +640,8 @@ pub async fn update_me(
             user.accent = accent;
         }
         if let Some(lang) = settings.lang {
-            if !matches!(lang.as_str(), "auto" | "en" | "de") {
-                return Err(AppError::bad_request("lang must be auto, en, or de"));
+            if !matches!(lang.as_str(), "auto" | "en" | "de" | "es") {
+                return Err(AppError::bad_request("lang must be auto, en, de, or es"));
             }
             user.lang = lang;
         }

@@ -194,6 +194,14 @@ CREATE TABLE friends (
 );
 ";
 
+/// v0.8: a square profile picture (`users.avatar`, a small self-contained
+/// `data:` URL or NULL) and per-share-link permission (`books.share_mode`:
+/// `'import'` = recipient gets their own copy, `'read'` = read-only, no copy).
+const SCHEMA_V9: &str = "
+ALTER TABLE users ADD COLUMN avatar TEXT;
+ALTER TABLE books ADD COLUMN share_mode TEXT NOT NULL DEFAULT 'import';
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -255,6 +263,11 @@ impl Db {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V8}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 8)?;
         }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 9 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V9}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 9)?;
+        }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -303,6 +316,8 @@ pub struct User {
     pub plan: String,
     /// Credit-based Pro time: epoch seconds until which Pro is active.
     pub pro_until: i64,
+    /// Square profile picture: a small self-contained `data:` URL, or None.
+    pub avatar: Option<String>,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -320,13 +335,14 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         lang: r.get(10)?,
         plan: r.get(11)?,
         pro_until: r.get(12)?,
+        avatar: r.get(13)?,
     })
 }
 
 const USER_COLS: &str = "id, email, name, password_hash, username, onboarded, wpm, theme, \
-                         guest, accent, lang, plan, pro_until";
+                         guest, accent, lang, plan, pro_until, avatar";
 const USER_COLS_U: &str = "u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, \
-                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan, u.pro_until";
+                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan, u.pro_until, u.avatar";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -365,7 +381,7 @@ pub fn insert_user(c: &Connection, user: &User, now: i64) -> rusqlite::Result<()
 pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE users SET name = ?2, username = ?3, onboarded = ?4, wpm = ?5, theme = ?6,
-                          accent = ?7, lang = ?8
+                          accent = ?7, lang = ?8, avatar = ?9
          WHERE id = ?1",
         params![
             user.id,
@@ -375,7 +391,8 @@ pub fn update_profile(c: &Connection, user: &User) -> rusqlite::Result<()> {
             user.wpm,
             user.theme,
             user.accent,
-            user.lang
+            user.lang,
+            user.avatar
         ],
     )?;
     Ok(())
@@ -835,11 +852,15 @@ pub fn list_trash(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<(Book, 
 
 /// Set (or keep) a live book's share token. Returns the active token, or
 /// None when the book is missing/trashed.
+/// Mint (or return the existing) share token for a live book and set its
+/// permission `mode` ('import' | 'read'). Re-sharing keeps the same token but
+/// always refreshes the mode, so the owner can flip read-only ↔ importable.
 pub fn ensure_share_token(
     c: &Connection,
     user_id: &str,
     id: &str,
     fresh: &str,
+    mode: &str,
 ) -> rusqlite::Result<Option<String>> {
     let existing: Option<Option<String>> = c
         .query_row(
@@ -850,13 +871,14 @@ pub fn ensure_share_token(
         .optional()?;
     match existing {
         None => Ok(None),
-        Some(Some(token)) => Ok(Some(token)),
-        Some(None) => {
+        Some(current) => {
+            let token = current.unwrap_or_else(|| fresh.to_string());
             c.execute(
-                "UPDATE books SET share_token = ?3 WHERE id = ?1 AND user_id = ?2",
-                params![id, user_id, fresh],
+                "UPDATE books SET share_token = ?3, share_mode = ?4
+                 WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id, token, mode],
             )?;
-            Ok(Some(fresh.to_string()))
+            Ok(Some(token))
         }
     }
 }
@@ -871,14 +893,15 @@ pub fn clear_share_token(c: &Connection, user_id: &str, id: &str) -> rusqlite::R
     Ok(n > 0)
 }
 
-/// Resolve a public share token to (owner_id, book) — live books only.
+/// Resolve a public share token to (owner_id, book, share_mode) — live books
+/// only. `share_mode` is 'import' (recipient may copy it) or 'read' (read-only).
 pub fn book_by_share_token(
     c: &Connection,
     token: &str,
-) -> rusqlite::Result<Option<(String, Book)>> {
+) -> rusqlite::Result<Option<(String, Book, String)>> {
     c.query_row(
         &format!(
-            "SELECT user_id, {BOOK_COLS} FROM books
+            "SELECT user_id, {BOOK_COLS}, share_mode FROM books
              WHERE share_token = ?1 AND deleted_at IS NULL"
         ),
         [token],
@@ -899,7 +922,8 @@ pub fn book_by_share_token(
                 category: r.get(12)?,
                 tags: serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default(),
             };
-            Ok((owner, book))
+            let mode: String = r.get(14)?;
+            Ok((owner, book, mode))
         },
     )
     .optional()

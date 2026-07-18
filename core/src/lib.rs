@@ -60,6 +60,10 @@ impl Timeline {
 enum Lang {
     En,
     De,
+    /// Spanish is detected for correct language routing, but has no validated
+    /// Zipf table yet — its pacing is driven by the length + structure model
+    /// (neutral frequency), never by mis-reading Spanish words as "rare".
+    Es,
 }
 
 const EN_MARKERS: [&str; 24] = [
@@ -70,12 +74,17 @@ const DE_MARKERS: [&str; 24] = [
     "der", "die", "und", "das", "ist", "ich", "nicht", "sie", "es", "ein", "er", "zu", "sich",
     "den", "auf", "mit", "dass", "wie", "im", "für", "aber", "als", "auch", "war",
 ];
+const ES_MARKERS: [&str; 24] = [
+    "de", "la", "que", "el", "en", "los", "no", "un", "por", "con", "una", "su", "para", "al",
+    "lo", "como", "más", "pero", "sus", "le", "se", "ha", "muy", "las",
+];
 
 /// Which frequency table fits this document: count function-word hits over
 /// the first ~500 tokens. Ties (and marker-free text) fall back to English.
 fn detect_lang(tokens: &[&str]) -> Lang {
     let mut en = 0usize;
     let mut de = 0usize;
+    let mut es = 0usize;
     for token in tokens.iter().take(500) {
         let lower = core_of(token).to_lowercase();
         if EN_MARKERS.contains(&lower.as_str()) {
@@ -84,8 +93,13 @@ fn detect_lang(tokens: &[&str]) -> Lang {
         if DE_MARKERS.contains(&lower.as_str()) {
             de += 1;
         }
+        if ES_MARKERS.contains(&lower.as_str()) {
+            es += 1;
+        }
     }
-    if de > en {
+    if es > en && es > de {
+        Lang::Es
+    } else if de > en {
         Lang::De
     } else {
         Lang::En
@@ -115,6 +129,9 @@ fn freq_factor(core: &str, lang: Lang) -> f32 {
     let table = match lang {
         Lang::En => &*FREQ_EN,
         Lang::De => &*FREQ_DE,
+        // No validated Spanish table yet: stay neutral and let length +
+        // structure carry the pacing (honest > a wrong frequency signal).
+        Lang::Es => return 1.0,
     };
     let lower = core.to_lowercase();
     match table.get(lower.as_str()) {
@@ -452,8 +469,14 @@ mod tests {
         let de: Vec<&str> = "der Hund lief durch die Stadt und war müde"
             .split_whitespace()
             .collect();
+        let es: Vec<&str> = "el perro corrió por la ciudad y no estaba muy cansado con las patas"
+            .split_whitespace()
+            .collect();
         assert_eq!(detect_lang(&en), Lang::En);
         assert_eq!(detect_lang(&de), Lang::De);
+        assert_eq!(detect_lang(&es), Lang::Es);
+        // Spanish stays neutral (no table) rather than tagging words as rare.
+        assert_eq!(freq_factor("ciudad", Lang::Es), 1.0);
     }
 
     #[test]

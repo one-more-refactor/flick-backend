@@ -140,6 +140,7 @@ fn api_router() -> Router<AppState> {
             post(books::share_book).delete(books::unshare_book),
         )
         .route("/shared/{token}", get(books::shared_info))
+        .route("/shared/{token}/timeline", get(books::shared_timeline))
         .route("/shared/{token}/import", post(books::shared_import))
         .route("/import/url", post(books::import_url))
         .route("/import/html", post(books::import_html))
