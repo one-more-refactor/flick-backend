@@ -236,7 +236,11 @@ pub async fn guest(State(state): State<AppState>) -> Result<Response, AppError> 
     let stored = user.clone();
     state
         .db
-        .call(move |c| db::insert_user(c, &stored, now))
+        .call(move |c| {
+            db::insert_user(c, &stored, now)?;
+            // Contract "Starter library": no library ever starts empty.
+            crate::catalog::seed_default_library(c, &stored.id, now)
+        })
         .await?;
     let body = user_json(&state, &user).await?;
     start_session(&state, &user.id, StatusCode::CREATED, body).await
@@ -412,7 +416,7 @@ pub async fn register(
                     return Ok(false);
                 }
                 db::insert_user(c, &user, now)?;
-                crate::books::seed_intro_book(c, &user.id, now)?;
+                crate::catalog::seed_default_library(c, &user.id, now)?;
                 Ok(true)
             }
         })

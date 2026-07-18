@@ -396,6 +396,25 @@ pub fn merge_guest_into(
             [guest_id],
         )?;
     }
+    // Both sides carry the seeded catalog (contract "Starter library"): for
+    // each slug present on both, keep the copy that was read further — drop
+    // the target's copy when the guest got past it, then any guest copy whose
+    // slug still exists on the target.
+    tx.execute(
+        "DELETE FROM books WHERE user_id = ?2 AND catalog_slug IS NOT NULL AND EXISTS (
+             SELECT 1 FROM books g
+             WHERE g.user_id = ?1 AND g.catalog_slug = books.catalog_slug
+               AND g.position > books.position
+         )",
+        params![guest_id, target_id],
+    )?;
+    tx.execute(
+        "DELETE FROM books WHERE user_id = ?1 AND catalog_slug IS NOT NULL AND EXISTS (
+             SELECT 1 FROM books t
+             WHERE t.user_id = ?2 AND t.catalog_slug = books.catalog_slug
+         )",
+        params![guest_id, target_id],
+    )?;
     tx.execute(
         "UPDATE books SET user_id = ?2 WHERE user_id = ?1",
         params![guest_id, target_id],

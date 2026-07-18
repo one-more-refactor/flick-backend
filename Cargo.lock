@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "flick-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "flick-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2",
  "axum",

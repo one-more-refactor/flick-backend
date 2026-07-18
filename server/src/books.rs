@@ -110,16 +110,17 @@ pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rus
     db::insert_book(c, user_id, &book, &timeline_json, Some(INTRO_TEXT), None)
 }
 
-/// Guests are not seeded at creation — they get the intro book alongside
-/// their FIRST own add instead, so an empty guest library never exists
-/// (contract). Call before inserting the user's new book.
-pub fn maybe_seed_guest_intro(
+/// Backstop for pre-v0.4.1 guest rows that are still empty: guests are now
+/// seeded with the full starter library at creation (contract "Starter
+/// library"), but an old empty guest gets it alongside their first own add
+/// instead. Call before inserting the user's new book.
+pub fn maybe_seed_guest_defaults(
     c: &rusqlite::Connection,
     user: &db::User,
     now: i64,
 ) -> rusqlite::Result<()> {
     if user.guest && db::book_count(c, &user.id)? == 0 {
-        seed_intro_book(c, &user.id, now)?;
+        crate::catalog::seed_default_library(c, &user.id, now)?;
     }
     Ok(())
 }
@@ -254,7 +255,7 @@ async fn insert_prepared(
                     return Ok(false);
                 }
             }
-            maybe_seed_guest_intro(c, &user, stored.created_at)?;
+            maybe_seed_guest_defaults(c, &user, stored.created_at)?;
             db::insert_book(c, &user.id, &stored, &timeline_json, Some(&text), None)?;
             Ok(true)
         })

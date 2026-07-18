@@ -497,7 +497,7 @@ async fn complete(
             }
             db::insert_user(c, &candidate, now)?;
             db::link_identity(c, &provider_owned, &sub, &candidate.id, Some(&email))?;
-            crate::books::seed_intro_book(c, &candidate.id, now)?;
+            crate::catalog::seed_default_library(c, &candidate.id, now)?;
             Ok(Ok(candidate))
         })
         .await?;

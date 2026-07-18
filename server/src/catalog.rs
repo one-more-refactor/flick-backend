@@ -114,6 +114,47 @@ fn cached_timeline(c: &Connection, entry: &CatalogEntry) -> rusqlite::Result<(Ve
         .map(|hit| hit.expect("catalog_cache row just ensured"))
 }
 
+/// Seed a brand-new library (contract "Starter library"): the intro book plus
+/// every catalog work. `created_at` is staggered — intro at `now`, catalog
+/// works descending in manifest order — so the default list order is stable
+/// under `ORDER BY created_at DESC`.
+pub fn seed_default_library(
+    c: &Connection,
+    user_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    crate::books::seed_intro_book(c, user_id, now)?;
+    for (i, entry) in MANIFEST.iter().enumerate() {
+        if db::book_id_by_catalog_slug(c, user_id, &entry.slug)?.is_some() {
+            continue;
+        }
+        let (timeline_json, word_count) = cached_timeline(c, entry)?;
+        let book = Book {
+            id: random_token(16),
+            title: entry.title.clone(),
+            source: "catalog".into(),
+            word_count,
+            position: 0,
+            created_at: now - 1 - i as i64,
+            last_read_at: None,
+            author: Some(entry.author.clone()),
+            url: None,
+            favicon: None,
+            excerpt: None,
+            category: category_for(&entry.kind).map(str::to_string),
+        };
+        db::insert_book(
+            c,
+            user_id,
+            &book,
+            &timeline_json,
+            Some(text_for(&entry.file)),
+            Some(&entry.slug),
+        )?;
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------- handlers
 
 /// GET /api/catalog — public, no auth (contract).
@@ -167,7 +208,7 @@ pub async fn add(
                 return Ok(Outcome::Duplicate(book_id));
             }
             let (timeline_json, word_count) = cached_timeline(c, &entry)?;
-            crate::books::maybe_seed_guest_intro(c, &user, now)?;
+            crate::books::maybe_seed_guest_defaults(c, &user, now)?;
             let book = Book {
                 id: random_token(16),
                 title: entry.title.clone(),

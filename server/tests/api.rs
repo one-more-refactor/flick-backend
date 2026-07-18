@@ -384,11 +384,11 @@ async fn books_full_flow() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // list contains it (plus the seeded intro book)
+    // list contains it (plus the seeded starter library: intro + 9 catalog)
     let resp = send(&app, bare_request("GET", "/api/books", Some(&cookie))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let list = body_json(resp).await;
-    assert_eq!(list.as_array().map(Vec::len), Some(2));
+    assert_eq!(list.as_array().map(Vec::len), Some(11));
     assert!(list
         .as_array()
         .expect("array")
@@ -546,13 +546,15 @@ async fn new_user_defaults_and_starter_book() {
     assert_eq!(me["settings"]["accent"], "red");
     assert_eq!(me["settings"]["lang"], "auto");
 
+    // Starter library: the intro book first, then the full catalog.
     let books =
         body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
     let books = books.as_array().expect("array");
-    assert_eq!(books.len(), 1);
+    assert_eq!(books.len(), 10);
     assert_eq!(books[0]["source"], "intro");
     assert_eq!(books[0]["title"], "Welcome to flick");
     assert!(books[0]["word_count"].as_i64().expect("count") > 100);
+    assert_eq!(books.iter().filter(|b| b["source"] == "catalog").count(), 9);
 
     // The intro book has a playable timeline like any other book.
     let id = books[0]["id"].as_str().expect("id");
@@ -633,7 +635,7 @@ async fn patch_me_validation() {
 async fn guest_create_first_add_and_merge_on_register() {
     let (app, _dir) = test_app();
 
-    // Anonymous session: a real user row, no email, no intro book yet.
+    // Anonymous session: a real user row, no email, seeded starter library.
     let resp = send(&app, bare_request("POST", "/api/auth/guest", None)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let guest_cookie = session_cookie(&resp);
@@ -643,22 +645,21 @@ async fn guest_create_first_add_and_merge_on_register() {
     assert_eq!(guest["name"], "READER");
     let books =
         body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
-    assert_eq!(books.as_array().map(Vec::len), Some(0));
+    assert_eq!(books.as_array().map(Vec::len), Some(10));
 
-    // First add seeds the intro book alongside it.
+    // Adds land on top of the seeds; no second intro ever appears.
     let book = create_paste_book(&app, &guest_cookie, Some("Mine"), "Guest words go here.").await;
     let id = book["id"].as_str().expect("id").to_string();
     let books =
         body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
     let books = books.as_array().expect("array");
-    assert_eq!(books.len(), 2);
+    assert_eq!(books.len(), 11);
     assert_eq!(books.iter().filter(|b| b["source"] == "intro").count(), 1);
 
-    // A second add does NOT seed another intro.
     create_paste_book(&app, &guest_cookie, Some("More"), "Even more guest words.").await;
     let books =
         body_json(send(&app, bare_request("GET", "/api/books", Some(&guest_cookie))).await).await;
-    assert_eq!(books.as_array().map(Vec::len), Some(3));
+    assert_eq!(books.as_array().map(Vec::len), Some(12));
 
     // Reading as a guest: position + stats live on the guest row.
     let resp = send(
@@ -690,11 +691,13 @@ async fn guest_create_first_add_and_merge_on_register() {
     assert_eq!(user["guest"], false);
     assert_eq!(user["email"], "merged@example.com");
 
-    // Books moved over; exactly ONE intro book (no duplicate).
+    // Books moved over; both sides' seeds dedup — one intro, one copy per
+    // catalog slug (starter library 10 + Mine + More).
     let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
     let books = books.as_array().expect("array");
-    assert_eq!(books.len(), 3); // intro + Mine + More
+    assert_eq!(books.len(), 12);
     assert_eq!(books.iter().filter(|b| b["source"] == "intro").count(), 1);
+    assert_eq!(books.iter().filter(|b| b["source"] == "catalog").count(), 9);
     assert!(books.iter().any(|b| b["id"] == id.as_str()));
 
     // Stats moved over too.
@@ -1057,6 +1060,34 @@ async fn catalog_list_add_and_duplicate() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let cookie = register(&app, "catalog@example.com").await;
+
+    // The starter library already carries every catalog work, so an add of a
+    // seeded slug is the idempotent 409 with the existing copy's id.
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let seeded_magi_id = books
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|b| b["title"] == "The Gift of the Magi")
+        .expect("seeded magi")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["book_id"], seeded_magi_id.as_str());
+
+    // Delete the seeded copy → a fresh add takes the real 201 path again.
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{seeded_magi_id}"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = send(
         &app,
         bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
@@ -1091,16 +1122,19 @@ async fn catalog_list_add_and_duplicate() {
     assert!(body["error"].is_string());
     assert_eq!(body["book_id"], book_id.as_str());
 
-    // Unknown slug → 404. Novella kind maps to the "book" category.
+    // Unknown slug → 404. Novella kind maps to the "book" category (visible
+    // on the seeded copy).
     let resp = send(&app, bare_request("POST", "/api/catalog/nope/add", Some(&cookie))).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let resp = send(
-        &app,
-        bare_request("POST", "/api/catalog/die-verwandlung/add", Some(&cookie)),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(body_json(resp).await["category"], "book");
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let kafka = books
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|b| b["title"] == "Die Verwandlung")
+        .expect("seeded verwandlung")
+        .clone();
+    assert_eq!(kafka["category"], "book");
 }
 
 // ------------------------------------------------- v0.3b: imports & search
@@ -1311,9 +1345,9 @@ async fn search_scopes_to_user_and_matches_title_and_body() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["title"], "Astronomy Notes");
 
-    // No q → the whole library (Astronomy + Cooking + seeded intro).
+    // No q → the whole library (Astronomy + Cooking + seeded starter library).
     let resp = send(&app, bare_request("GET", "/api/books", Some(&alice))).await;
-    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(3));
+    assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(12));
 
     // A no-op / punctuation-only query returns an empty list, never a 500.
     let resp = send(&app, bare_request("GET", "/api/books?q=%20%2A%2A%2A", Some(&alice))).await;
@@ -1408,7 +1442,24 @@ async fn hosted_free_plan_enforces_weekly_upload_limit() {
     assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()));
     assert_eq!(body["code"], "upload_limit");
 
-    // Catalog adds neither count nor get blocked at the limit.
+    // Catalog adds neither count nor get blocked at the limit (delete the
+    // seeded copy first so the add takes the real 201 path).
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let magi_id = books
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|b| b["title"] == "The Gift of the Magi")
+        .expect("seeded magi")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{magi_id}"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = send(
         &app,
         bare_request("POST", "/api/catalog/gift-of-the-magi/add", Some(&cookie)),
@@ -1440,7 +1491,7 @@ async fn hosted_guests_are_limited_too() {
     let user = body_json(resp).await;
     assert_eq!(user["uploads"], json!({"used": 0, "limit": 15}));
 
-    // 15 pastes pass (the lazily seeded guest intro book doesn't count) ...
+    // 15 pastes pass (the seeded starter library doesn't count) ...
     for i in 0..15 {
         create_paste_book(&app, &cookie, Some(&format!("Guest {i}")), "guest words").await;
     }
