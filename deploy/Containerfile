@@ -1,0 +1,45 @@
+# flick — production image (backend + bundled web client).
+#
+# Multi-stage: build the Svelte client with Bun, build the Rust server with
+# cargo, then assemble a slim Debian runtime that serves the API under /api and
+# the static web client at /. Native build — pick the host arch (arm64 on the
+# prod box, amd64 on CI). No cross-compile, no QEMU.
+#
+#   podman build -t flick-backend:latest -f deploy/Containerfile .
+
+# ---- web client ---------------------------------------------------------
+FROM docker.io/oven/bun:1 AS web
+WORKDIR /web
+COPY web/package.json web/bun.lock ./
+RUN bun install --frozen-lockfile || bun install
+COPY web/ ./
+RUN bun run build
+
+# ---- server -------------------------------------------------------------
+# rust:bookworm carries gcc, which rusqlite's bundled SQLite needs to compile.
+FROM docker.io/library/rust:1-bookworm AS server
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY core/ core/
+COPY server/ server/
+RUN cargo build --release -p flick-server
+
+# ---- runtime ------------------------------------------------------------
+FROM docker.io/library/debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# rustls everywhere (no OpenSSL); only CA roots are needed for outbound HTTPS.
+WORKDIR /app
+COPY --from=server /src/target/release/flick-server /usr/local/bin/flick-server
+COPY --from=web /web/dist /app/web/dist
+# Defaults; the Quadlet unit overrides edition / public URL / data dir.
+ENV FLICK_WEB_DIST=/app/web/dist \
+    FLICK_DATA_DIR=/data \
+    FLICK_ADDR=0.0.0.0:8484
+RUN useradd --system --uid 10001 --home /app flick \
+    && mkdir -p /data && chown flick:flick /data
+USER flick
+VOLUME ["/data"]
+EXPOSE 8484
+ENTRYPOINT ["/usr/local/bin/flick-server"]

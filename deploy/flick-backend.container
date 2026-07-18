@@ -1,0 +1,31 @@
+# Quadlet unit for the flick backend (rootless podman + systemd --user).
+# Install: copy to ~/.config/containers/systemd/ then
+#   systemctl --user daemon-reload && systemctl --user start flick-backend
+# Requires: `loginctl enable-linger $USER` so it runs without an active login.
+[Unit]
+Description=flick backend (hosted edition)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/flick-backend:latest
+ContainerName=flick-backend
+# Loopback only — Cloudflare Tunnel reaches this; no public port is exposed.
+PublishPort=127.0.0.1:3011:8484
+Volume=flick-data:/data
+Environment=FLICK_EDITION=hosted
+Environment=FLICK_PUBLIC_URL=https://app.myflick.app
+Environment=FLICK_ADDR=0.0.0.0:8484
+Environment=FLICK_DATA_DIR=/data
+# Set a real admin token on the host; keep it out of git.
+Environment=FLICK_ADMIN_TOKEN=CHANGE_ME
+# Email login codes are logged until SMTP is configured; password auth works today.
+# Environment=FLICK_SMTP_URL=smtps://user:pass@smtp.host:465
+# Environment=FLICK_SMTP_FROM=flick <no-reply@myflick.app>
+
+[Service]
+Restart=always
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target
