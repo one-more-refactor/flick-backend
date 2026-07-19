@@ -15,7 +15,7 @@ ARG WEB_REF=master
 FROM docker.io/oven/bun:1 AS web
 ARG WEB_REPO
 ARG WEB_REF
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /web
 RUN git clone --depth 1 --branch "$WEB_REF" "$WEB_REPO" .
