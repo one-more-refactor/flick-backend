@@ -31,6 +31,8 @@ fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
         dropbox_app_key: None,
         google_picker_api_key: None,
         admin_token: Some("test-admin-token".into()),
+        admin_origin: None,
+        admin_url: None,
     };
     let db = Db::open(&config.data_dir).expect("open db");
     let state = AppState::new(db, config);
@@ -67,6 +69,8 @@ fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::
         dropbox_app_key: None,
         google_picker_api_key: None,
         admin_token: Some("test-admin-token".into()),
+        admin_origin: None,
+        admin_url: None,
     };
     mutate(&mut config);
     let db = Db::open(&config.data_dir).expect("open db");
@@ -2395,7 +2399,8 @@ async fn meta_reports_selfhost_edition_and_version() {
     let body = body_json(resp).await;
     assert_eq!(
         body,
-        json!({"edition": "selfhost", "version": env!("CARGO_PKG_VERSION")})
+        json!({"edition": "selfhost", "version": env!("CARGO_PKG_VERSION"),
+               "announcement": null, "admin_url": null})
     );
 }
 
@@ -2707,4 +2712,213 @@ async fn xff_from_public_peer_is_ignored() {
         };
         assert_eq!(resp.status(), expect, "request {i}");
     }
+}
+
+// ------------------------------------------------------------------ admin
+
+fn bearer_request(method: &str, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    let body = match body {
+        Some(v) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    builder.body(body).expect("request")
+}
+
+#[tokio::test]
+async fn admin_full_flow() {
+    let (app, _dir) = test_app();
+    let env_token = "test-admin-token";
+
+    // Break-glass token works; garbage doesn't.
+    let resp = send(
+        &app,
+        bearer_request("GET", "/api/admin/me", env_token, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["via"], "token");
+    let resp = send(&app, bearer_request("GET", "/api/admin/me", "nope", None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Promote a registered user via the env token.
+    let cookie = register(&app, "root@example.com").await;
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["is_admin"], false);
+    let uid = me["id"].as_str().expect("id").to_string();
+    let resp = send(
+        &app,
+        bearer_request(
+            "PATCH",
+            &format!("/api/admin/users/{uid}"),
+            env_token,
+            Some(json!({"is_admin": true})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
+    assert_eq!(me["is_admin"], true);
+
+    // Admin session login: wrong password rejected, right one yields a token.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "root@example.com", "password": "wrong-password!!"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "root@example.com", "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let session = body_json(resp).await;
+    let s_token = session["token"].as_str().expect("token").to_string();
+    let resp = send(&app, bearer_request("GET", "/api/admin/me", &s_token, None)).await;
+    let via = body_json(resp).await;
+    assert_eq!(via["via"], "session");
+    assert_eq!(via["email"], "root@example.com");
+
+    // Overview carries totals and version.
+    let resp = send(
+        &app,
+        bearer_request("GET", "/api/admin/overview", &s_token, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let overview = body_json(resp).await;
+    assert!(overview["totals"]["users"].as_i64().expect("users") >= 1);
+    assert_eq!(overview["totals"]["admins"], 1);
+    assert!(overview["version"].is_string());
+
+    // User list finds the admin by email fragment.
+    let resp = send(
+        &app,
+        bearer_request("GET", "/api/admin/users?q=root@", &s_token, None),
+    )
+    .await;
+    let list = body_json(resp).await;
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["users"][0]["is_admin"], true);
+
+    // A session admin cannot demote or delete themselves...
+    let resp = send(
+        &app,
+        bearer_request(
+            "PATCH",
+            &format!("/api/admin/users/{uid}"),
+            &s_token,
+            Some(json!({"is_admin": false})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = send(
+        &app,
+        bearer_request("DELETE", &format!("/api/admin/users/{uid}"), &s_token, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // ...and guests can never become admins.
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/guest", None, json!({})),
+    )
+    .await;
+    let guest_cookie = session_cookie(&resp);
+    let guest = body_json(
+        send(
+            &app,
+            bare_request("GET", "/api/auth/me", Some(&guest_cookie)),
+        )
+        .await,
+    )
+    .await;
+    let resp = send(
+        &app,
+        bearer_request(
+            "PATCH",
+            &format!("/api/admin/users/{}", guest["id"].as_str().expect("id")),
+            &s_token,
+            Some(json!({"is_admin": true})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Announcement publishes into /api/meta and clears again.
+    let meta = body_json(send(&app, bare_request("GET", "/api/meta", None)).await).await;
+    assert!(meta["announcement"].is_null());
+    let resp = send(
+        &app,
+        bearer_request(
+            "PUT",
+            "/api/admin/announcement",
+            &s_token,
+            Some(
+                json!({"text": "flick got an admin panel", "link": "https://admin.myflick.app",
+                        "label": "open", "active": true}),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(send(&app, bare_request("GET", "/api/meta", None)).await).await;
+    assert_eq!(meta["announcement"]["text"], "flick got an admin panel");
+    assert_eq!(meta["announcement"]["label"], "open");
+    let resp = send(
+        &app,
+        bearer_request(
+            "PUT",
+            "/api/admin/announcement",
+            &s_token,
+            Some(json!({"active": false})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(send(&app, bare_request("GET", "/api/meta", None)).await).await;
+    assert!(meta["announcement"].is_null());
+
+    // Logout revokes the session token.
+    let resp = send(
+        &app,
+        bearer_request("DELETE", "/api/admin/session", &s_token, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send(&app, bearer_request("GET", "/api/admin/me", &s_token, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_hidden_when_unconfigured() {
+    // No env token, no admin users: the surface answers 404, not 401.
+    let (app, _dir) = test_app_with_config(|c| c.admin_token = None);
+    let resp = send(&app, bare_request("GET", "/api/admin/overview", None)).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = send(
+        &app,
+        bearer_request("GET", "/api/admin/me", "whatever", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

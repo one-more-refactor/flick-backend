@@ -29,7 +29,7 @@ const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
-static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+pub(crate) static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
     // Infallible in practice: fixed input, default params.
     hash_password("flick-dummy-password-for-timing").expect("argon2 dummy hash")
 });
@@ -50,7 +50,7 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
         .map_err(AppError::internal)
 }
 
-fn verify_password(password: &str, hash: &str) -> bool {
+pub(crate) fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash)
         .map(|parsed| {
             Argon2::default()
@@ -60,7 +60,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     Sha256::digest(input.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -136,6 +136,7 @@ pub async fn user_json(state: &AppState, user: &User) -> Result<Value, AppError>
         "guest": user.guest,
         "onboarded": user.onboarded,
         "plan": user.plan,
+        "is_admin": user.is_admin,
         "pro_active": pro,
         "pro_days": pro_days,
         "avatar": user.avatar,
@@ -172,6 +173,7 @@ pub fn new_user(
         plan: "free".into(),
         pro_until: 0,
         avatar: None,
+        is_admin: false,
     }
 }
 

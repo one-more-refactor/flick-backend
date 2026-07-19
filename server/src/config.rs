@@ -50,8 +50,12 @@ pub struct Config {
     pub smtp_from: String,
     pub dropbox_app_key: Option<String>,
     pub google_picker_api_key: Option<String>,
-    /// Bearer token guarding /api/admin/* (events). None disables admin API.
+    /// Break-glass bearer for /api/admin/* (CONTRACTS.md "Admin API").
     pub admin_token: Option<String>,
+    /// Admin panel origin allowed via CORS (e.g. https://admin.myflick.app).
+    pub admin_origin: Option<String>,
+    /// Admin panel URL surfaced in /api/meta for the ADMIN menu link.
+    pub admin_url: Option<String>,
 }
 
 /// Default web dist (CONTRACTS.md): first of `./web/dist`, `../web/dist`
@@ -139,6 +143,8 @@ impl Config {
             dropbox_app_key: env_var("FLICK_DROPBOX_APP_KEY"),
             google_picker_api_key: env_var("FLICK_GOOGLE_PICKER_API_KEY"),
             admin_token: env_var("FLICK_ADMIN_TOKEN").filter(|t| !t.is_empty()),
+            admin_origin: env_var("FLICK_ADMIN_ORIGIN").filter(|t| !t.is_empty()),
+            admin_url: env_var("FLICK_ADMIN_URL").filter(|t| !t.is_empty()),
         }
     }
 

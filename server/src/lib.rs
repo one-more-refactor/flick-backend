@@ -3,6 +3,7 @@
 //! API surface, timeline format, env config, and error shape are specified in
 //! docs/CONTRACTS.md. Parsing lives exclusively in flick-core.
 
+pub mod admin;
 pub mod auth;
 pub mod books;
 pub mod catalog;
@@ -24,10 +25,11 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -41,6 +43,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub oauth: Arc<oidc::OauthRuntime>,
     pub limiter: Arc<ratelimit::RateLimiter>,
+    /// Process start, for /api/admin/overview uptime.
+    pub started: std::time::Instant,
 }
 
 impl AppState {
@@ -50,6 +54,7 @@ impl AppState {
             config: Arc::new(config),
             oauth: Arc::new(oidc::OauthRuntime::default()),
             limiter: Arc::new(ratelimit::RateLimiter::new(ratelimit::RateLimits::default())),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -63,11 +68,14 @@ impl AppState {
 /// GET /api/meta — public, no auth: which edition this server runs and its
 /// version. Clients switch the Pro/Contribute UI on `edition` (CONTRACTS.md
 /// "Editions & plans").
-async fn meta(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
+async fn meta(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let announcement = state.db.call(db::announcement_public).await?;
+    Ok(Json(json!({
         "edition": state.config.edition.as_str(),
         "version": env!("CARGO_PKG_VERSION"),
-    }))
+        "announcement": announcement,
+        "admin_url": state.config.admin_url,
+    })))
 }
 
 async fn api_not_found() -> AppError {
@@ -166,6 +174,19 @@ fn api_router() -> Router<AppState> {
             get(referral::admin_list).post(referral::admin_create),
         )
         .route("/admin/events/{id}", delete(referral::admin_delete))
+        .route("/admin/login", post(admin::login))
+        .route("/admin/session", delete(admin::logout))
+        .route("/admin/me", get(admin::me))
+        .route("/admin/overview", get(admin::overview))
+        .route("/admin/users", get(admin::users_list))
+        .route(
+            "/admin/users/{id}",
+            patch(admin::user_patch).delete(admin::user_delete),
+        )
+        .route(
+            "/admin/announcement",
+            get(admin::announcement_get).put(admin::announcement_put),
+        )
         .route("/friends", get(social::list))
         .route("/friends/link", get(social::link))
         .route("/friends/add", post(social::add))
@@ -189,6 +210,30 @@ pub fn app(state: AppState) -> Router {
             .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
     } else {
         router.fallback(no_web_dist)
+    };
+
+    // The admin panel lives on its own origin (CONTRACTS.md "Admin API &
+    // panel"); auth is bearer-only, so no credentialed CORS is ever needed.
+    let router = match state.config.admin_origin.as_deref() {
+        Some(origin) => match origin.parse::<HeaderValue>() {
+            Ok(origin) => router.layer(
+                CorsLayer::new()
+                    .allow_origin(origin)
+                    .allow_methods([
+                        axum::http::Method::GET,
+                        axum::http::Method::POST,
+                        axum::http::Method::PUT,
+                        axum::http::Method::PATCH,
+                        axum::http::Method::DELETE,
+                    ])
+                    .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+            ),
+            Err(_) => {
+                tracing::warn!("FLICK_ADMIN_ORIGIN is not a valid origin; CORS disabled");
+                router
+            }
+        },
+        None => router,
     };
 
     router

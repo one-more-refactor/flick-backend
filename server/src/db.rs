@@ -202,6 +202,29 @@ ALTER TABLE users ADD COLUMN avatar TEXT;
 ALTER TABLE books ADD COLUMN share_mode TEXT NOT NULL DEFAULT 'import';
 ";
 
+/// v0.10: the admin surface (CONTRACTS.md \"Admin API & panel\"). `is_admin`
+/// marks operator accounts; admin_sessions hold their sha256-hashed bearer
+/// tokens; announcement is a single row published into `/api/meta` while
+/// active.
+const SCHEMA_V10: &str = "
+ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE announcement (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    text       TEXT NOT NULL DEFAULT '',
+    link       TEXT NOT NULL DEFAULT '',
+    label      TEXT NOT NULL DEFAULT '',
+    active     INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO announcement (id) VALUES (1);
+";
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -268,6 +291,11 @@ impl Db {
             conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V9}\nCOMMIT;"))?;
             conn.pragma_update(None, "user_version", 9)?;
         }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 10 {
+            conn.execute_batch(&format!("BEGIN;\n{SCHEMA_V10}\nCOMMIT;"))?;
+            conn.pragma_update(None, "user_version", 10)?;
+        }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -318,6 +346,7 @@ pub struct User {
     pub pro_until: i64,
     /// Square profile picture: a small self-contained `data:` URL, or None.
     pub avatar: Option<String>,
+    pub is_admin: bool,
 }
 
 fn row_user(r: &Row) -> rusqlite::Result<User> {
@@ -336,13 +365,15 @@ fn row_user(r: &Row) -> rusqlite::Result<User> {
         plan: r.get(11)?,
         pro_until: r.get(12)?,
         avatar: r.get(13)?,
+        is_admin: r.get::<_, i64>(14)? != 0,
     })
 }
 
 const USER_COLS: &str = "id, email, name, password_hash, username, onboarded, wpm, theme, \
-                         guest, accent, lang, plan, pro_until, avatar";
+                         guest, accent, lang, plan, pro_until, avatar, is_admin";
 const USER_COLS_U: &str = "u.id, u.email, u.name, u.password_hash, u.username, u.onboarded, \
-                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan, u.pro_until, u.avatar";
+                           u.wpm, u.theme, u.guest, u.accent, u.lang, u.plan, u.pro_until, \
+                           u.avatar, u.is_admin";
 
 pub fn user_by_email(c: &Connection, email: &str) -> rusqlite::Result<Option<User>> {
     c.query_row(
@@ -1397,4 +1428,286 @@ pub fn sessions_between(
         params![user_id, start, end],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
+}
+
+// ------------------------------------------------------------------ admin
+
+/// Look up the user behind a live admin session token hash.
+pub fn admin_session_user(
+    c: &Connection,
+    token_hash: &str,
+    now: i64,
+) -> rusqlite::Result<Option<User>> {
+    c.query_row(
+        &format!(
+            "SELECT {USER_COLS_U} FROM admin_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.is_admin = 1"
+        ),
+        rusqlite::params![token_hash, now],
+        row_user,
+    )
+    .optional()
+}
+
+pub fn any_admin_exists(c: &Connection) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = 1)",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )
+}
+
+/// Store a new admin session; opportunistically prunes expired ones.
+pub fn admin_session_insert(
+    c: &Connection,
+    token_hash: &str,
+    user_id: &str,
+    now: i64,
+    expires_at: i64,
+) -> rusqlite::Result<()> {
+    c.execute("DELETE FROM admin_sessions WHERE expires_at <= ?1", [now])?;
+    c.execute(
+        "INSERT INTO admin_sessions (token_hash, user_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![token_hash, user_id, now, expires_at],
+    )?;
+    Ok(())
+}
+
+pub fn admin_session_delete(c: &Connection, token_hash: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM admin_sessions WHERE token_hash = ?1",
+        [token_hash],
+    )?;
+    Ok(())
+}
+
+pub fn user_set_admin(c: &Connection, user_id: &str, is_admin: bool) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET is_admin = ?2 WHERE id = ?1",
+        rusqlite::params![user_id, is_admin as i64],
+    )?;
+    // Demoting kills their panel sessions immediately.
+    if !is_admin {
+        c.execute("DELETE FROM admin_sessions WHERE user_id = ?1", [user_id])?;
+    }
+    Ok(())
+}
+
+pub fn user_set_plan(c: &Connection, user_id: &str, plan: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE users SET plan = ?2 WHERE id = ?1",
+        rusqlite::params![user_id, plan],
+    )?;
+    Ok(())
+}
+
+/// Everything the admin dashboard shows, in one transaction-free sweep of
+/// aggregate queries (SQLite makes these cheap at this scale).
+pub fn admin_overview(c: &Connection) -> rusqlite::Result<serde_json::Value> {
+    use serde_json::json;
+    let (users_total, users_registered, admins): (i64, i64, i64) = c.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(guest = 0), 0),
+                COALESCE(SUM(is_admin), 0)
+         FROM users",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let books_total: i64 = c.query_row(
+        "SELECT COUNT(*) FROM books WHERE deleted_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let (words_total, readers_total): (i64, i64) = c.query_row(
+        "SELECT COALESCE(SUM(words), 0), COUNT(DISTINCT user_id) FROM reading_days",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let sessions_total: i64 = c.query_row("SELECT COUNT(*) FROM sessions_log", [], |r| r.get(0))?;
+
+    let since = crate::stats::utc_day(-29);
+    let series = |sql: &str| -> rusqlite::Result<Vec<serde_json::Value>> {
+        let mut stmt = c.prepare(sql)?;
+        let rows = stmt
+            .query_map([&since], |r| {
+                Ok(json!({"day": r.get::<_, String>(0)?, "value": r.get::<_, i64>(1)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    };
+    let words_by_day = series(
+        "SELECT day, SUM(words) FROM reading_days WHERE day >= ?1 GROUP BY day ORDER BY day",
+    )?;
+    let readers_by_day = series(
+        "SELECT day, COUNT(DISTINCT user_id) FROM reading_days WHERE day >= ?1
+         GROUP BY day ORDER BY day",
+    )?;
+    let signups_by_day = series(
+        "SELECT date(created_at, 'unixepoch'), COUNT(*) FROM users
+         WHERE guest = 0 AND date(created_at, 'unixepoch') >= ?1
+         GROUP BY 1 ORDER BY 1",
+    )?;
+
+    let active = |days: i64| -> rusqlite::Result<i64> {
+        c.query_row(
+            "SELECT COUNT(DISTINCT user_id) FROM reading_days WHERE day >= ?1",
+            [crate::stats::utc_day(-(days - 1))],
+            |r| r.get(0),
+        )
+    };
+    let (active_1d, active_7d, active_30d) = (active(1)?, active(7)?, active(30)?);
+
+    let mut stmt = c.prepare(
+        "SELECT (avg_wpm / 50) * 50 AS bucket, COUNT(*) FROM sessions_log
+         WHERE avg_wpm BETWEEN 50 AND 1200 GROUP BY bucket ORDER BY bucket",
+    )?;
+    let wpm_histogram = stmt
+        .query_map([], |r| {
+            Ok(json!({"wpm": r.get::<_, i64>(0)?, "sessions": r.get::<_, i64>(1)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut stmt = c.prepare(
+        "SELECT b.title, COALESCE(b.author, ''), COUNT(DISTINCT s.user_id) AS readers,
+                SUM(s.words)
+         FROM sessions_log s JOIN books b ON b.id = s.book_id
+         GROUP BY s.book_id ORDER BY readers DESC, 4 DESC LIMIT 10",
+    )?;
+    let top_books = stmt
+        .query_map([], |r| {
+            Ok(json!({
+                "title": r.get::<_, String>(0)?,
+                "author": r.get::<_, String>(1)?,
+                "readers": r.get::<_, i64>(2)?,
+                "words": r.get::<_, i64>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let db_size: i64 = c.query_row(
+        "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+        [],
+        |r| r.get(0),
+    )?;
+
+    Ok(json!({
+        "totals": {
+            "users": users_total,
+            "registered": users_registered,
+            "guests": users_total - users_registered,
+            "admins": admins,
+            "books": books_total,
+            "words": words_total,
+            "readers": readers_total,
+            "sessions": sessions_total,
+        },
+        "active": {"d1": active_1d, "d7": active_7d, "d30": active_30d},
+        "series": {
+            "words": words_by_day,
+            "readers": readers_by_day,
+            "signups": signups_by_day,
+        },
+        "wpm_histogram": wpm_histogram,
+        "top_books": top_books,
+        "db_size_bytes": db_size,
+    }))
+}
+
+/// Paged user list for the panel; `q` matches email or name.
+pub fn admin_users(
+    c: &Connection,
+    q: &str,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<serde_json::Value> {
+    use serde_json::json;
+    let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
+    let total: i64 = c.query_row(
+        "SELECT COUNT(*) FROM users
+         WHERE ?1 = '' OR email LIKE ?2 ESCAPE '\\' OR name LIKE ?2 ESCAPE '\\'",
+        rusqlite::params![q, pattern],
+        |r| r.get(0),
+    )?;
+    let mut stmt = c.prepare(
+        "SELECT u.id, u.email, u.name, u.guest, u.is_admin, u.plan, u.pro_until,
+                u.created_at, COALESCE(rd.words, 0), rd.last_day
+         FROM users u
+         LEFT JOIN (SELECT user_id, SUM(words) AS words, MAX(day) AS last_day
+                    FROM reading_days GROUP BY user_id) rd ON rd.user_id = u.id
+         WHERE ?1 = '' OR u.email LIKE ?2 ESCAPE '\\' OR u.name LIKE ?2 ESCAPE '\\'
+         ORDER BY u.created_at DESC LIMIT ?3 OFFSET ?4",
+    )?;
+    let now = now_secs();
+    let users = stmt
+        .query_map(rusqlite::params![q, pattern, limit, offset], |r| {
+            let pro_until: i64 = r.get(6)?;
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "email": r.get::<_, Option<String>>(1)?,
+                "name": r.get::<_, String>(2)?,
+                "guest": r.get::<_, i64>(3)? != 0,
+                "is_admin": r.get::<_, i64>(4)? != 0,
+                "plan": r.get::<_, String>(5)?,
+                "pro_days": if pro_until > now { (pro_until - now).div_euclid(86_400) + 1 } else { 0 },
+                "created_at": r.get::<_, i64>(7)?,
+                "words": r.get::<_, i64>(8)?,
+                "last_day": r.get::<_, Option<String>>(9)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(json!({"total": total, "users": users}))
+}
+
+pub fn announcement_get(c: &Connection) -> rusqlite::Result<serde_json::Value> {
+    use serde_json::json;
+    c.query_row(
+        "SELECT text, link, label, active, updated_at FROM announcement WHERE id = 1",
+        [],
+        |r| {
+            Ok(json!({
+                "text": r.get::<_, String>(0)?,
+                "link": r.get::<_, String>(1)?,
+                "label": r.get::<_, String>(2)?,
+                "active": r.get::<_, i64>(3)? != 0,
+                "updated_at": r.get::<_, i64>(4)?,
+            }))
+        },
+    )
+}
+
+pub fn announcement_put(
+    c: &Connection,
+    text: &str,
+    link: &str,
+    label: &str,
+    active: bool,
+    now: i64,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE announcement SET text = ?1, link = ?2, label = ?3, active = ?4, updated_at = ?5
+         WHERE id = 1",
+        rusqlite::params![text, link, label, active as i64, now],
+    )?;
+    Ok(())
+}
+
+/// The public slice of the announcement for `/api/meta`: Some only while
+/// active and non-empty.
+pub fn announcement_public(c: &Connection) -> rusqlite::Result<Option<serde_json::Value>> {
+    use serde_json::json;
+    let row = c
+        .query_row(
+            "SELECT text, link, label FROM announcement WHERE id = 1 AND active = 1",
+            [],
+            |r| {
+                Ok(json!({
+                    "text": r.get::<_, String>(0)?,
+                    "link": r.get::<_, String>(1)?,
+                    "label": r.get::<_, String>(2)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row.filter(|v| !v["text"].as_str().unwrap_or("").is_empty()))
 }

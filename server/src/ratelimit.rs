@@ -55,6 +55,7 @@ pub struct RateLimits {
     pub guest: Rule,
     pub import_url: Rule,
     pub friend_add: Rule,
+    pub admin_login: Rule,
 }
 
 impl Default for RateLimits {
@@ -68,6 +69,7 @@ impl Default for RateLimits {
             guest: Rule::new(20, HOUR),
             import_url: Rule::new(30, HOUR),
             friend_add: Rule::new(30, FIVE_MIN),
+            admin_login: Rule::new(10, FIVE_MIN),
         }
     }
 }
@@ -89,6 +91,7 @@ impl RateLimits {
             "/api/auth/guest" => Some(("guest", self.guest)),
             "/api/import/url" => Some(("import_url", self.import_url)),
             "/api/friends/add" => Some(("friend_add", self.friend_add)),
+            "/api/admin/login" => Some(("admin_login", self.admin_login)),
             _ => None,
         }
     }

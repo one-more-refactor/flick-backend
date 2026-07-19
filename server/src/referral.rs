@@ -117,30 +117,6 @@ pub async fn active(State(state): State<AppState>) -> Result<Json<Value>, AppErr
 
 // ------------------------------------------------------------- admin API
 
-/// Constant-time bearer check against FLICK_ADMIN_TOKEN (404 when unset so
-/// the endpoint's existence isn't advertised).
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
-    let Some(expected) = state.config.admin_token.as_deref() else {
-        return Err(AppError::NotFound);
-    };
-    let given = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    let ok = expected.len() == given.len()
-        && expected
-            .bytes()
-            .zip(given.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0;
-    if ok {
-        Ok(())
-    } else {
-        Err(AppError::Unauthorized)
-    }
-}
-
 #[derive(Deserialize)]
 pub struct EventBody {
     kind: String,
@@ -159,7 +135,7 @@ pub async fn admin_create(
     headers: HeaderMap,
     AppJson(body): AppJson<EventBody>,
 ) -> Result<Response, AppError> {
-    require_admin(&state, &headers)?;
+    crate::admin::require_admin(&state, &headers).await?;
     if !EVENT_KINDS.contains(&body.kind.as_str()) {
         return Err(AppError::bad_request(
             "kind must be referral | free_pro | promo",
@@ -189,7 +165,7 @@ pub async fn admin_list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<db::Event>>, AppError> {
-    require_admin(&state, &headers)?;
+    crate::admin::require_admin(&state, &headers).await?;
     let events = state.db.call(db::list_events).await?;
     Ok(Json(events))
 }
@@ -200,7 +176,7 @@ pub async fn admin_delete(
     headers: HeaderMap,
     AppPath(id): AppPath<String>,
 ) -> Result<StatusCode, AppError> {
-    require_admin(&state, &headers)?;
+    crate::admin::require_admin(&state, &headers).await?;
     let gone = state.db.call(move |c| db::delete_event(c, &id)).await?;
     if gone {
         Ok(StatusCode::NO_CONTENT)
