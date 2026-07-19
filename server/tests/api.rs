@@ -361,6 +361,31 @@ async fn books_full_flow() {
     let sentence = words[6][2].as_f64().expect("w"); // "here." ends the text
     assert!(plain < clause && clause < sentence && sentence < para);
 
+    // Timeline responses use negotiated compression for realistic book-sized payloads.
+    let large = create_paste_book(
+        &app,
+        &cookie,
+        Some("Compressible"),
+        &"repeated reading words ".repeat(200),
+    )
+    .await;
+    let large_id = large["id"].as_str().expect("id");
+    let mut req = bare_request(
+        "GET",
+        &format!("/api/books/{large_id}/timeline"),
+        Some(&cookie),
+    );
+    req.headers_mut()
+        .insert(header::ACCEPT_ENCODING, "gzip".parse().expect("encoding"));
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
+
     // update position, visible in GET
     let resp = send(
         &app,
@@ -396,7 +421,7 @@ async fn books_full_flow() {
     let resp = send(&app, bare_request("GET", "/api/books", Some(&cookie))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let list = body_json(resp).await;
-    assert_eq!(list.as_array().map(Vec::len), Some(11));
+    assert_eq!(list.as_array().map(Vec::len), Some(12));
     assert!(list
         .as_array()
         .expect("array")

@@ -27,6 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -192,6 +193,7 @@ pub fn app(state: AppState) -> Router {
     };
 
     router
+        .layer(CompressionLayer::new())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::rate_limit,
