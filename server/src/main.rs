@@ -48,8 +48,8 @@ async fn main() {
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server run");
+    .await
+    .expect("server run");
 }
 
 /// SIGINT (ctrl-c) or SIGTERM (systemd stop) — both drain gracefully.

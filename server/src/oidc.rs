@@ -20,9 +20,7 @@ use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
-use openidconnect::core::{
-    CoreAuthenticationFlow, CoreClient, CoreProviderMetadata,
-};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
     EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
@@ -31,9 +29,7 @@ use openidconnect::{
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::auth::{
-    merge_guest_from_request, new_user, random_token, start_session, user_json,
-};
+use crate::auth::{merge_guest_from_request, new_user, random_token, start_session, user_json};
 use crate::config::Config;
 use crate::db::{self, now_secs};
 use crate::error::{AppError, AppPath};
@@ -74,7 +70,12 @@ impl OauthRuntime {
         let (cell, issuer, client_id, client_secret) = match provider {
             "oidc" => {
                 let s = config.oidc.as_ref().ok_or(AppError::NotFound)?;
-                (&self.oidc, s.issuer.clone(), s.client_id.clone(), s.client_secret.clone())
+                (
+                    &self.oidc,
+                    s.issuer.clone(),
+                    s.client_id.clone(),
+                    s.client_secret.clone(),
+                )
             }
             "google" => {
                 let s = config.oauth_google.as_ref().ok_or(AppError::NotFound)?;
@@ -308,11 +309,7 @@ async fn oidc_callback(
         .name()
         .and_then(|n| n.get(None))
         .map(|n| n.as_str().to_string())
-        .or_else(|| {
-            claims
-                .preferred_username()
-                .map(|u| u.as_str().to_string())
-        })
+        .or_else(|| claims.preferred_username().map(|u| u.as_str().to_string()))
         .or_else(|| {
             email
                 .as_deref()
@@ -327,10 +324,14 @@ async fn oidc_callback(
 // -------------------------------------------------------- GitHub flavor
 
 async fn github_login(state: &AppState) -> Result<Response, AppError> {
-    let creds = state.config.oauth_github.as_ref().ok_or(AppError::NotFound)?;
+    let creds = state
+        .config
+        .oauth_github
+        .as_ref()
+        .ok_or(AppError::NotFound)?;
     let token = random_token(16);
-    let mut url = openidconnect::url::Url::parse(GITHUB_AUTHORIZE_URL)
-        .map_err(AppError::internal)?;
+    let mut url =
+        openidconnect::url::Url::parse(GITHUB_AUTHORIZE_URL).map_err(AppError::internal)?;
     url.query_pairs_mut()
         .append_pair("client_id", &creds.client_id)
         .append_pair("redirect_uri", &callback_url(&state.config, "github"))
@@ -352,7 +353,10 @@ async fn github_get(
         .send()
         .await
         .map_err(|e| {
-            AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub API unreachable: {e}"))
+            AppError::Status(
+                StatusCode::BAD_GATEWAY,
+                format!("GitHub API unreachable: {e}"),
+            )
         })?;
     if !resp.status().is_success() {
         return Err(AppError::Status(
@@ -361,11 +365,13 @@ async fn github_get(
         ));
     }
     let text = resp.text().await.map_err(|e| {
-        AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub API read failed: {e}"))
+        AppError::Status(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub API read failed: {e}"),
+        )
     })?;
-    serde_json::from_str(&text).map_err(|e| {
-        AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub API bad JSON: {e}"))
-    })
+    serde_json::from_str(&text)
+        .map_err(|e| AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub API bad JSON: {e}")))
 }
 
 async fn github_callback(
@@ -373,7 +379,11 @@ async fn github_callback(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<Response, AppError> {
-    let creds = state.config.oauth_github.as_ref().ok_or(AppError::NotFound)?;
+    let creds = state
+        .config
+        .oauth_github
+        .as_ref()
+        .ok_or(AppError::NotFound)?;
 
     let query = callback_query(uri)?;
     let code = query
@@ -414,10 +424,16 @@ async fn github_callback(
             )
         })?;
     let text = resp.text().await.map_err(|e| {
-        AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub token read failed: {e}"))
+        AppError::Status(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub token read failed: {e}"),
+        )
     })?;
     let token_json: Value = serde_json::from_str(&text).map_err(|e| {
-        AppError::Status(StatusCode::BAD_GATEWAY, format!("GitHub token bad JSON: {e}"))
+        AppError::Status(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub token bad JSON: {e}"),
+        )
     })?;
     let access_token = token_json["access_token"].as_str().ok_or_else(|| {
         AppError::Status(
@@ -436,7 +452,10 @@ async fn github_callback(
     let sub = profile["id"]
         .as_i64()
         .ok_or_else(|| {
-            AppError::Status(StatusCode::BAD_GATEWAY, "GitHub /user returned no id".into())
+            AppError::Status(
+                StatusCode::BAD_GATEWAY,
+                "GitHub /user returned no id".into(),
+            )
         })?
         .to_string();
     let name = profile["name"]

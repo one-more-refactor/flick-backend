@@ -110,19 +110,14 @@ fn ensure_cached(c: &Connection, entry: &CatalogEntry) -> rusqlite::Result<i64> 
 /// The cached `(timeline_json, word_count)` for a work, parsing on miss.
 fn cached_timeline(c: &Connection, entry: &CatalogEntry) -> rusqlite::Result<(Vec<u8>, i64)> {
     ensure_cached(c, entry)?;
-    db::catalog_cache_get(c, &entry.slug)
-        .map(|hit| hit.expect("catalog_cache row just ensured"))
+    db::catalog_cache_get(c, &entry.slug).map(|hit| hit.expect("catalog_cache row just ensured"))
 }
 
 /// Seed a brand-new library (contract "Starter library"): the intro book plus
 /// every catalog work. `created_at` is staggered — intro at `now`, catalog
 /// works descending in manifest order — so the default list order is stable
 /// under `ORDER BY created_at DESC`.
-pub fn seed_default_library(
-    c: &Connection,
-    user_id: &str,
-    now: i64,
-) -> rusqlite::Result<()> {
+pub fn seed_default_library(c: &Connection, user_id: &str, now: i64) -> rusqlite::Result<()> {
     crate::books::seed_intro_book(c, user_id, now)?;
     for (i, entry) in MANIFEST.iter().enumerate() {
         if db::book_id_by_catalog_slug(c, user_id, &entry.slug)?.is_some() {

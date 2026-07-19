@@ -417,7 +417,11 @@ pub fn delete_user(c: &Connection, user_id: &str, email: Option<&str>) -> rusqli
 /// data is included.
 pub fn export_user(c: &Connection, user: &User) -> rusqlite::Result<serde_json::Value> {
     let created_at: i64 = c
-        .query_row("SELECT created_at FROM users WHERE id = ?1", [&user.id], |r| r.get(0))
+        .query_row(
+            "SELECT created_at FROM users WHERE id = ?1",
+            [&user.id],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
 
     let mut books = Vec::new();
@@ -509,9 +513,8 @@ pub fn link_identity(
 
 /// Distinct OAuth providers linked to a user (for the lookup `methods` list).
 pub fn identity_providers(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = c.prepare(
-        "SELECT DISTINCT provider FROM identities WHERE user_id = ?1 ORDER BY provider",
-    )?;
+    let mut stmt =
+        c.prepare("SELECT DISTINCT provider FROM identities WHERE user_id = ?1 ORDER BY provider")?;
     let rows = stmt.query_map([user_id], |r| r.get(0))?;
     rows.collect()
 }
@@ -523,11 +526,7 @@ pub fn identity_providers(c: &Connection, user_id: &str) -> rusqlite::Result<Vec
 /// deleted (cascading its auth sessions). The intro book never duplicates —
 /// when the target already has one, the guest's copy is dropped. No-op when
 /// `guest_id` is not actually a guest.
-pub fn merge_guest_into(
-    c: &Connection,
-    guest_id: &str,
-    target_id: &str,
-) -> rusqlite::Result<()> {
+pub fn merge_guest_into(c: &Connection, guest_id: &str, target_id: &str) -> rusqlite::Result<()> {
     let is_guest: Option<i64> = c
         .query_row("SELECT guest FROM users WHERE id = ?1", [guest_id], |r| {
             r.get(0)
@@ -649,10 +648,7 @@ pub fn upsert_login_code(
 }
 
 /// `(code_hash, expires_at, attempts)` for a pending code.
-pub fn login_code(
-    c: &Connection,
-    email: &str,
-) -> rusqlite::Result<Option<(String, i64, i64)>> {
+pub fn login_code(c: &Connection, email: &str) -> rusqlite::Result<Option<(String, i64, i64)>> {
     c.query_row(
         "SELECT code_hash, expires_at, attempts FROM login_codes WHERE email = ?1",
         [email],
@@ -796,7 +792,9 @@ pub fn list_books(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<Book>> 
 
 pub fn get_book(c: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Option<Book>> {
     c.query_row(
-        &format!("SELECT {BOOK_COLS} FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL"),
+        &format!(
+            "SELECT {BOOK_COLS} FROM books WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL"
+        ),
         params![id, user_id],
         row_book,
     )
@@ -1006,7 +1004,12 @@ pub fn book_by_share_token(
 }
 
 /// Replace a live book's tags (already validated + serialized by the caller).
-pub fn set_tags(c: &Connection, user_id: &str, id: &str, tags_json: &str) -> rusqlite::Result<bool> {
+pub fn set_tags(
+    c: &Connection,
+    user_id: &str,
+    id: &str,
+    tags_json: &str,
+) -> rusqlite::Result<bool> {
     let n = c.execute(
         "UPDATE books SET tags = ?3 WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
         params![id, user_id, tags_json],
@@ -1099,16 +1102,18 @@ pub fn stats_totals(c: &Connection, user_id: &str) -> rusqlite::Result<StatsTota
     })
 }
 
-pub fn insert_session_log(
-    c: &Connection,
-    user_id: &str,
-    s: &SessionLog,
-) -> rusqlite::Result<()> {
+pub fn insert_session_log(c: &Connection, user_id: &str, s: &SessionLog) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO sessions_log (id, user_id, book_id, started_at, duration_ms, words, avg_wpm)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            s.id, user_id, s.book_id, s.started_at, s.duration_ms, s.words, s.avg_wpm
+            s.id,
+            user_id,
+            s.book_id,
+            s.started_at,
+            s.duration_ms,
+            s.words,
+            s.avg_wpm
         ],
     )?;
     Ok(())
@@ -1149,10 +1154,7 @@ pub fn list_sessions_log(
 // ---------------------------------------------------------- catalog cache
 
 /// Cached parse of a catalog work, `(timeline_json, word_count)`.
-pub fn catalog_cache_get(
-    c: &Connection,
-    slug: &str,
-) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+pub fn catalog_cache_get(c: &Connection, slug: &str) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
     c.query_row(
         "SELECT timeline, word_count FROM catalog_cache WHERE slug = ?1",
         [slug],
@@ -1183,13 +1185,14 @@ pub fn catalog_cache_put(
     Ok(())
 }
 
-
 // ------------------------------------------------------- referrals (v0.7)
 
 /// Lazily mint (or return) the user's referral/friend code.
 pub fn ensure_ref_code(c: &Connection, user_id: &str, fresh: &str) -> rusqlite::Result<String> {
     let existing: Option<Option<String>> = c
-        .query_row("SELECT ref_code FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+        .query_row("SELECT ref_code FROM users WHERE id = ?1", [user_id], |r| {
+            r.get(0)
+        })
         .optional()?;
     match existing.flatten() {
         Some(code) => Ok(code),
@@ -1204,8 +1207,10 @@ pub fn ensure_ref_code(c: &Connection, user_id: &str, fresh: &str) -> rusqlite::
 }
 
 pub fn user_id_by_ref_code(c: &Connection, code: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT id FROM users WHERE ref_code = ?1", [code], |r| r.get(0))
-        .optional()
+    c.query_row("SELECT id FROM users WHERE ref_code = ?1", [code], |r| {
+        r.get(0)
+    })
+    .optional()
 }
 
 /// Record who referred a fresh signup (once; never self).
@@ -1227,28 +1232,23 @@ pub fn set_referred_by(
 pub type ReferralChild = (String, bool, i64, Option<String>);
 
 /// A referrer's invitees.
-pub fn referral_children(
-    c: &Connection,
-    user_id: &str,
-) -> rusqlite::Result<Vec<ReferralChild>> {
-    let mut stmt = c.prepare(
-        "SELECT id, guest, ref_credited, signup_ip FROM users WHERE referred_by = ?1",
-    )?;
+pub fn referral_children(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<ReferralChild>> {
+    let mut stmt =
+        c.prepare("SELECT id, guest, ref_credited, signup_ip FROM users WHERE referred_by = ?1")?;
     let rows = stmt.query_map([user_id], |r| {
-        Ok((
-            r.get(0)?,
-            r.get::<_, i64>(1)? != 0,
-            r.get(2)?,
-            r.get(3)?,
-        ))
+        Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?))
     })?;
     rows.collect()
 }
 
 pub fn user_signup_ip(c: &Connection, user_id: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT signup_ip FROM users WHERE id = ?1", [user_id], |r| r.get(0))
-        .optional()
-        .map(Option::flatten)
+    c.query_row(
+        "SELECT signup_ip FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
 }
 
 /// Days on which the user hit the reading goal (referral qualification).
@@ -1303,8 +1303,9 @@ pub fn delete_event(c: &Connection, id: &str) -> rusqlite::Result<bool> {
 }
 
 pub fn list_events(c: &Connection) -> rusqlite::Result<Vec<Event>> {
-    let mut stmt =
-        c.prepare("SELECT id, kind, title, starts_at, ends_at, payload FROM events ORDER BY starts_at DESC")?;
+    let mut stmt = c.prepare(
+        "SELECT id, kind, title, starts_at, ends_at, payload FROM events ORDER BY starts_at DESC",
+    )?;
     let rows = stmt.query_map([], row_event)?;
     rows.collect()
 }
@@ -1352,9 +1353,8 @@ pub fn remove_friend(c: &Connection, x: &str, y: &str) -> rusqlite::Result<bool>
 }
 
 pub fn friend_ids(c: &Connection, user_id: &str) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = c.prepare(
-        "SELECT CASE WHEN a = ?1 THEN b ELSE a END FROM friends WHERE a = ?1 OR b = ?1",
-    )?;
+    let mut stmt =
+        c.prepare("SELECT CASE WHEN a = ?1 THEN b ELSE a END FROM friends WHERE a = ?1 OR b = ?1")?;
     let rows = stmt.query_map([user_id], |r| r.get(0))?;
     rows.collect()
 }

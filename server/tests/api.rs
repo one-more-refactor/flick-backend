@@ -196,7 +196,11 @@ async fn register_login_logout_me_flow() {
     assert_eq!(body_json(resp).await["email"], "a@example.com");
 
     // logout clears the cookie and invalidates the session
-    let resp = send(&app, bare_request("POST", "/api/auth/logout", Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/auth/logout", Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let cleared = resp
         .headers()
@@ -269,7 +273,12 @@ async fn auth_required_401s_are_json() {
         bare_request("GET", "/api/books", None),
         json_request("POST", "/api/books", None, json!({"text": "hi"})),
         bare_request("GET", "/api/books/xyz/timeline", None),
-        json_request("PUT", "/api/books/xyz/position", None, json!({"position": 0})),
+        json_request(
+            "PUT",
+            "/api/books/xyz/position",
+            None,
+            json!({"position": 0}),
+        ),
         bare_request("DELETE", "/api/books/xyz", None),
     ] {
         let resp = send(&app, req).await;
@@ -343,7 +352,9 @@ async fn books_full_flow() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some("application/json")
     );
     let timeline = body_json(resp).await;
@@ -398,7 +409,11 @@ async fn books_full_flow() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let resp = send(&app, bare_request("GET", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["position"], 3);
 
@@ -429,7 +444,11 @@ async fn books_full_flow() {
         .any(|b| b["id"] == id.as_str()));
 
     // delete, then everything 404s
-    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = send(&app, bare_request("GET", "/api/books", Some(&cookie))).await;
     let remaining = body_json(resp).await;
@@ -580,8 +599,7 @@ async fn new_user_defaults_and_starter_book() {
     assert_eq!(me["settings"]["lang"], "auto");
 
     // Starter library: the intro book first, then the full catalog.
-    let books =
-        body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
+    let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
     let books = books.as_array().expect("array");
     assert_eq!(books.len(), 10);
     assert_eq!(books[0]["source"], "intro");
@@ -647,7 +665,11 @@ async fn patch_me_validation() {
         (json!({"settings": {"theme": "neon"}}), "theme"),
         (json!({"name": "   "}), "name"),
     ] {
-        let resp = send(&app, json_request("PATCH", "/api/auth/me", Some(&cookie), body)).await;
+        let resp = send(
+            &app,
+            json_request("PATCH", "/api/auth/me", Some(&cookie), body),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let err = body_json(resp).await;
         assert!(
@@ -738,7 +760,11 @@ async fn guest_create_first_add_and_merge_on_register() {
     assert_eq!(stats["total_words"], 350);
 
     // The guest row is gone: its session no longer resolves.
-    let resp = send(&app, bare_request("GET", "/api/auth/me", Some(&guest_cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", "/api/auth/me", Some(&guest_cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -751,7 +777,12 @@ async fn lookup_known_and_unknown_email() {
 
     let resp = send(
         &app,
-        json_request("POST", "/api/auth/lookup", None, json!({"email": "KNOWN@example.com"})),
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": "KNOWN@example.com"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -761,7 +792,12 @@ async fn lookup_known_and_unknown_email() {
 
     let resp = send(
         &app,
-        json_request("POST", "/api/auth/lookup", None, json!({"email": "nobody@example.com"})),
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": "nobody@example.com"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -779,7 +815,12 @@ async fn login_code_roundtrip() {
     for email in ["code@example.com", "nobody@example.com"] {
         let resp = send(
             &app,
-            json_request("POST", "/api/auth/code/request", None, json!({"email": email})),
+            json_request(
+                "POST",
+                "/api/auth/code/request",
+                None,
+                json!({"email": email}),
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -796,7 +837,12 @@ async fn login_code_roundtrip() {
     for (email, c) in [("code@example.com", wrong), ("nobody@example.com", &code)] {
         let resp = send(
             &app,
-            json_request("POST", "/api/auth/code/verify", None, json!({"email": email, "code": c})),
+            json_request(
+                "POST",
+                "/api/auth/code/verify",
+                None,
+                json!({"email": email, "code": c}),
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -895,7 +941,11 @@ async fn patch_me_accent_and_lang() {
         (json!({"settings": {"accent": "pink"}}), "accent"),
         (json!({"settings": {"lang": "fr"}}), "lang"),
     ] {
-        let resp = send(&app, json_request("PATCH", "/api/auth/me", Some(&cookie), body)).await;
+        let resp = send(
+            &app,
+            json_request("PATCH", "/api/auth/me", Some(&cookie), body),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let err = body_json(resp).await;
         assert!(
@@ -916,10 +966,7 @@ async fn stats_accumulate_and_streak() {
     let uri = format!("/api/books/{id}/position");
 
     // Report reads for yesterday and today (both above the 300 goal).
-    for (day, read) in [
-        (Some(flick_server::stats::utc_day(-1)), 400),
-        (None, 350),
-    ] {
+    for (day, read) in [(Some(flick_server::stats::utc_day(-1)), 400), (None, 350)] {
         let mut body = json!({"position": 1, "read": read});
         if let Some(d) = day {
             body["day"] = json!(d);
@@ -951,7 +998,12 @@ async fn stats_accumulate_and_streak() {
     // read is clamped to 500 per report.
     let resp = send(
         &app,
-        json_request("PUT", &uri, Some(&cookie), json!({"position": 1, "read": 9999})),
+        json_request(
+            "PUT",
+            &uri,
+            Some(&cookie),
+            json!({"position": 1, "read": 9999}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -998,8 +1050,14 @@ async fn position_bumps_last_read_at() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let got = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}"), Some(&cookie))).await)
-        .await;
+    let got = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let last_read = got["last_read_at"].as_i64().expect("last_read_at set");
     assert!(last_read >= got["created_at"].as_i64().expect("created_at"));
 }
@@ -1040,8 +1098,14 @@ async fn sessions_post_list_and_clamps() {
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let list = body_json(send(&app, bare_request("GET", "/api/sessions?limit=50", Some(&cookie))).await)
-        .await;
+    let list = body_json(
+        send(
+            &app,
+            bare_request("GET", "/api/sessions?limit=50", Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let list = list.as_array().expect("array");
     assert_eq!(list.len(), 2);
     // Newest first.
@@ -1075,9 +1139,14 @@ async fn sessions_post_list_and_clamps() {
 
     // Trashing the book keeps its title in the feed (the row still exists,
     // v0.4.3 soft delete); only a purge degrades it to the DELETED marker.
-    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
+    let list =
+        body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
     assert_eq!(list[0]["book_title"], "Session Book");
     let resp = send(
         &app,
@@ -1085,7 +1154,8 @@ async fn sessions_post_list_and_clamps() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let list = body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
+    let list =
+        body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
     assert_eq!(list[0]["book_title"], "DELETED");
     assert_eq!(list[1]["book_title"], "DELETED");
 }
@@ -1163,9 +1233,11 @@ async fn referral_flow_with_admin_event() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let event_id = body_json(resp).await["id"].as_str().expect("id").to_string();
-    let active =
-        body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
+    let event_id = body_json(resp).await["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let active = body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
     assert_eq!(active.as_array().map(Vec::len), Some(1));
     assert_eq!(active[0]["kind"], "referral");
 
@@ -1238,8 +1310,7 @@ async fn referral_flow_with_admin_event() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let active =
-        body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
+    let active = body_json(send(&app, bare_request("GET", "/api/events/active", None)).await).await;
     assert_eq!(active.as_array().map(Vec::len), Some(0));
 }
 
@@ -1254,32 +1325,52 @@ async fn friends_scoreboard_and_wrapped() {
     let uri = format!("/api/books/{}/position", book["id"].as_str().expect("id"));
     let resp = send(
         &app,
-        json_request("PUT", &uri, Some(&alice), json!({"position": 1, "read": 450})),
+        json_request(
+            "PUT",
+            &uri,
+            Some(&alice),
+            json!({"position": 1, "read": 450}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Connect via Alice's friend link (same personal code).
-    let link = body_json(send(&app, bare_request("GET", "/api/friends/link", Some(&alice))).await)
-        .await;
+    let link =
+        body_json(send(&app, bare_request("GET", "/api/friends/link", Some(&alice))).await).await;
     let code = link["code"].as_str().expect("code").to_string();
     assert_eq!(code.len(), 32, "friend codes carry 128 bits as hex");
     let resp = send(
         &app,
-        json_request("POST", "/api/friends/add", Some(&bob), json!({"code": code})),
+        json_request(
+            "POST",
+            "/api/friends/add",
+            Some(&bob),
+            json!({"code": code}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     // Self-add 409, unknown 404.
     let resp = send(
         &app,
-        json_request("POST", "/api/friends/add", Some(&alice), json!({"code": code})),
+        json_request(
+            "POST",
+            "/api/friends/add",
+            Some(&alice),
+            json!({"code": code}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let resp = send(
         &app,
-        json_request("POST", "/api/friends/add", Some(&bob), json!({"code": "nope"})),
+        json_request(
+            "POST",
+            "/api/friends/add",
+            Some(&bob),
+            json!({"code": "nope"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1317,7 +1408,13 @@ async fn friends_scoreboard_and_wrapped() {
 async fn share_link_flow() {
     let (app, _dir) = test_app();
     let alice = register(&app, "sharer@example.com").await;
-    let book = create_paste_book(&app, &alice, Some("Shared Words"), "Words worth passing on.").await;
+    let book = create_paste_book(
+        &app,
+        &alice,
+        Some("Shared Words"),
+        "Words worth passing on.",
+    )
+    .await;
     let id = book["id"].as_str().expect("id").to_string();
 
     // Mint a share link; a second mint returns the same token (idempotent).
@@ -1331,13 +1428,21 @@ async fn share_link_flow() {
     let token = share["token"].as_str().expect("token").to_string();
     assert_eq!(share["path"], format!("/s/{token}"));
     let again = body_json(
-        send(&app, bare_request("POST", &format!("/api/books/{id}/share"), Some(&alice))).await,
+        send(
+            &app,
+            bare_request("POST", &format!("/api/books/{id}/share"), Some(&alice)),
+        )
+        .await,
     )
     .await;
     assert_eq!(again["token"], token.as_str());
 
     // Public preview needs no auth.
-    let resp = send(&app, bare_request("GET", &format!("/api/shared/{token}"), None)).await;
+    let resp = send(
+        &app,
+        bare_request("GET", &format!("/api/shared/{token}"), None),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let info = body_json(resp).await;
     assert_eq!(info["title"], "Shared Words");
@@ -1357,8 +1462,11 @@ async fn share_link_flow() {
     assert_eq!(copy["title"], "Shared Words");
     let copy_id = copy["id"].as_str().expect("id");
     let tl = body_json(
-        send(&app, bare_request("GET", &format!("/api/books/{copy_id}/timeline"), Some(&bob)))
-            .await,
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{copy_id}/timeline"), Some(&bob)),
+        )
+        .await,
     )
     .await;
     assert_eq!(tl["version"], 1);
@@ -1387,7 +1495,13 @@ async fn share_link_flow() {
 async fn share_read_only_mode() {
     let (app, _dir) = test_app();
     let alice = register(&app, "readonly-owner@example.com").await;
-    let book = create_paste_book(&app, &alice, Some("Read Only"), "You may read but not keep.").await;
+    let book = create_paste_book(
+        &app,
+        &alice,
+        Some("Read Only"),
+        "You may read but not keep.",
+    )
+    .await;
     let id = book["id"].as_str().expect("id").to_string();
 
     // Share as read-only.
@@ -1408,8 +1522,14 @@ async fn share_read_only_mode() {
     let token = share["token"].as_str().expect("token").to_string();
 
     // Public preview advertises the mode; the timeline is publicly playable.
-    let info = body_json(send(&app, bare_request("GET", &format!("/api/shared/{token}"), None)).await)
-        .await;
+    let info = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/shared/{token}"), None),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(info["mode"], "read");
     let resp = send(
         &app,
@@ -1465,7 +1585,12 @@ async fn avatar_set_and_clear() {
     // Set a valid data:image avatar — it comes back on the user object.
     let resp = send(
         &app,
-        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": png })),
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "avatar": png }),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1475,7 +1600,12 @@ async fn avatar_set_and_clear() {
     let svg = "data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+PC9zdmc+";
     let resp = send(
         &app,
-        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": svg })),
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "avatar": svg }),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1492,17 +1622,20 @@ async fn avatar_set_and_clear() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        body_json(resp).await["error"]
-            .as_str()
-            .expect("error")
-            .contains("PNG, JPEG, or WebP")
-    );
+    assert!(body_json(resp).await["error"]
+        .as_str()
+        .expect("error")
+        .contains("PNG, JPEG, or WebP"));
 
     // An empty string clears it back to null.
     let resp = send(
         &app,
-        json_request("PATCH", "/api/auth/me", Some(&cookie), json!({ "avatar": "" })),
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "avatar": "" }),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1513,7 +1646,13 @@ async fn avatar_set_and_clear() {
 async fn account_export_and_delete() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "erase@example.com").await;
-    create_paste_book(&app, &cookie, Some("My Notes"), "Some private words to export.").await;
+    create_paste_book(
+        &app,
+        &cookie,
+        Some("My Notes"),
+        "Some private words to export.",
+    )
+    .await;
 
     // GDPR export: the account + the book's source text come back.
     let resp = send(&app, bare_request("GET", "/api/auth/export", Some(&cookie))).await;
@@ -1523,7 +1662,10 @@ async fn account_export_and_delete() {
     let books = dump["books"].as_array().expect("books");
     assert!(books.iter().any(|b| {
         b["title"] == "My Notes"
-            && b["text"].as_str().unwrap_or_default().contains("private words")
+            && b["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("private words")
     }));
 
     // GDPR erasure: account gone, session cleared, email free again.
@@ -1533,7 +1675,12 @@ async fn account_export_and_delete() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = send(
         &app,
-        json_request("POST", "/api/auth/lookup", None, json!({ "email": "erase@example.com" })),
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({ "email": "erase@example.com" }),
+        ),
     )
     .await;
     assert_eq!(body_json(resp).await["exists"], false);
@@ -1571,7 +1718,11 @@ async fn free_hosted_history_window() {
         }
         let list =
             body_json(send(&app, bare_request("GET", "/api/sessions", Some(&cookie))).await).await;
-        assert_eq!(list.as_array().map(Vec::len), Some(expect), "hosted={hosted}");
+        assert_eq!(
+            list.as_array().map(Vec::len),
+            Some(expect),
+            "hosted={hosted}"
+        );
     }
 }
 
@@ -1620,12 +1771,17 @@ async fn trash_restore_purge_and_tags() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Trash: the book vanishes from every live surface but sits in the bin.
-    let count_before = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await)
-        .await
-        .as_array()
-        .expect("array")
-        .len();
-    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let count_before =
+        body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await)
+            .await
+            .as_array()
+            .expect("array")
+            .len();
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     for path in [
         format!("/api/books/{id}"),
@@ -1638,11 +1794,17 @@ async fn trash_restore_purge_and_tags() {
     let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
     assert_eq!(books.as_array().expect("array").len(), count_before - 1);
     // Search must not surface trashed books either.
-    let hits = body_json(send(&app, bare_request("GET", "/api/books?q=binned", Some(&cookie))).await)
-        .await;
+    let hits = body_json(
+        send(
+            &app,
+            bare_request("GET", "/api/books?q=binned", Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(hits.as_array().map(Vec::len), Some(0));
-    let trash = body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await)
-        .await;
+    let trash =
+        body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await).await;
     assert_eq!(trash["retention_days"], 30);
     assert_eq!(trash["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(trash["items"][0]["id"], id.as_str());
@@ -1650,7 +1812,11 @@ async fn trash_restore_purge_and_tags() {
     assert!(trash["items"][0]["expires_at"].as_i64().expect("expiry") > 0);
 
     // A second delete of the same book is a 404 (it is no longer live).
-    let resp = send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // Restore: back in the library with tags intact, trash empty again.
@@ -1660,11 +1826,17 @@ async fn trash_restore_purge_and_tags() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let book = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}"), Some(&cookie))).await)
-        .await;
+    let book = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(book["tags"], json!(["sci-fi", "work"]));
-    let trash = body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await)
-        .await;
+    let trash =
+        body_json(send(&app, bare_request("GET", "/api/books/trash", Some(&cookie))).await).await;
     assert_eq!(trash["items"].as_array().map(Vec::len), Some(0));
     // Restore / purge on a live book are 404s.
     for req in [
@@ -1676,7 +1848,11 @@ async fn trash_restore_purge_and_tags() {
     }
 
     // Trash again, purge for good: gone from the bin AND unrestorable.
-    send(&app, bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie))).await;
+    send(
+        &app,
+        bare_request("DELETE", &format!("/api/books/{id}"), Some(&cookie)),
+    )
+    .await;
     let resp = send(
         &app,
         bare_request("DELETE", &format!("/api/books/{id}/purge"), Some(&cookie)),
@@ -1704,7 +1880,10 @@ async fn catalog_list_add_and_duplicate() {
     let catalog = catalog.as_array().expect("array");
     assert_eq!(catalog.len(), 9);
     for entry in catalog {
-        assert!(entry["word_count"].as_i64().expect("word_count") > 0, "{entry}");
+        assert!(
+            entry["word_count"].as_i64().expect("word_count") > 0,
+            "{entry}"
+        );
     }
     let magi = catalog
         .iter()
@@ -1714,7 +1893,11 @@ async fn catalog_list_add_and_duplicate() {
     assert_eq!(magi["kind"], "story");
 
     // Adding requires auth.
-    let resp = send(&app, bare_request("POST", "/api/catalog/gift-of-the-magi/add", None)).await;
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/gift-of-the-magi/add", None),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let cookie = register(&app, "catalog@example.com").await;
@@ -1742,7 +1925,11 @@ async fn catalog_list_add_and_duplicate() {
     // Delete the seeded copy → a fresh add takes the real 201 path again.
     let resp = send(
         &app,
-        bare_request("DELETE", &format!("/api/books/{seeded_magi_id}"), Some(&cookie)),
+        bare_request(
+            "DELETE",
+            &format!("/api/books/{seeded_magi_id}"),
+            Some(&cookie),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -1763,7 +1950,11 @@ async fn catalog_list_add_and_duplicate() {
     // The copied timeline is playable.
     let resp = send(
         &app,
-        bare_request("GET", &format!("/api/books/{book_id}/timeline"), Some(&cookie)),
+        bare_request(
+            "GET",
+            &format!("/api/books/{book_id}/timeline"),
+            Some(&cookie),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1782,7 +1973,11 @@ async fn catalog_list_add_and_duplicate() {
 
     // Unknown slug → 404. Novella kind maps to the "book" category (visible
     // on the seeded copy).
-    let resp = send(&app, bare_request("POST", "/api/catalog/nope/add", Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("POST", "/api/catalog/nope/add", Some(&cookie)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let books = body_json(send(&app, bare_request("GET", "/api/books", Some(&cookie))).await).await;
     let kafka = books
@@ -1804,7 +1999,11 @@ async fn epub_upload_extracts_text_and_metadata() {
 
     let bytes = include_bytes!("fixtures/minimal.epub");
     let resp = send(&app, upload_request(&cookie, "book.epub", bytes)).await;
-    assert_eq!(resp.status(), StatusCode::CREATED, "epub upload should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "epub upload should succeed"
+    );
     let book = body_json(resp).await;
     assert_eq!(book["source"], "epub");
     assert_eq!(book["category"], "book");
@@ -1814,15 +2013,33 @@ async fn epub_upload_extracts_text_and_metadata() {
 
     // The spine text made it in: search finds a chapter body word.
     let id = book["id"].as_str().expect("id").to_string();
-    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let text = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let flat: Vec<String> = text["paragraphs"]
         .as_array()
         .expect("paragraphs")
         .iter()
-        .flat_map(|p| p.as_array().expect("para").iter().map(|w| w.as_str().expect("word").to_string()))
+        .flat_map(|p| {
+            p.as_array()
+                .expect("para")
+                .iter()
+                .map(|w| w.as_str().expect("word").to_string())
+        })
         .collect();
-    assert!(flat.iter().any(|w| w.contains("harbor")), "expected 'harbor' in {flat:?}");
-    assert!(flat.iter().any(|w| w.contains("letter")), "expected ch2 text too");
+    assert!(
+        flat.iter().any(|w| w.contains("harbor")),
+        "expected 'harbor' in {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|w| w.contains("letter")),
+        "expected ch2 text too"
+    );
 }
 
 #[tokio::test]
@@ -1847,7 +2064,11 @@ The Pragmatic Programmer (Hunt, Andrew)
 Don't live with broken windows.
 ==========
 ";
-    let resp = send(&app, upload_request(&cookie, "My Clippings.txt", clippings.as_bytes())).await;
+    let resp = send(
+        &app,
+        upload_request(&cookie, "My Clippings.txt", clippings.as_bytes()),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let book = body_json(resp).await;
     assert_eq!(book["source"], "clippings");
@@ -1856,12 +2077,22 @@ Don't live with broken windows.
     assert_eq!(book["title"], "Kindle Clippings");
     let id = book["id"].as_str().expect("id").to_string();
 
-    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let text = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let paras = text["paragraphs"].as_array().expect("paragraphs");
     assert_eq!(paras.len(), 3, "one paragraph per highlight");
     // First paragraph starts with its source-book prefix.
     let first_word = paras[0][0].as_str().expect("word");
-    assert!(first_word.starts_with("The") , "expected book-title prefix, got {first_word:?}");
+    assert!(
+        first_word.starts_with("The"),
+        "expected book-title prefix, got {first_word:?}"
+    );
 }
 
 #[tokio::test]
@@ -1884,26 +2115,46 @@ async fn import_html_extracts_article() {
 
     let resp = send(
         &app,
-        json_request("POST", "/api/import/html", Some(&cookie), json!({
-            "url": "https://blog.example.com/speed-reading",
-            "html": html,
-        })),
+        json_request(
+            "POST",
+            "/api/import/html",
+            Some(&cookie),
+            json!({
+                "url": "https://blog.example.com/speed-reading",
+                "html": html,
+            }),
+        ),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::CREATED, "readability import should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "readability import should succeed"
+    );
     let book = body_json(resp).await;
     assert_eq!(book["source"], "html");
     assert_eq!(book["category"], "article");
     assert_eq!(book["url"], "https://blog.example.com/speed-reading");
     // Favicon falls back to the origin when we cannot glean one.
-    assert!(book["favicon"].as_str().expect("favicon").starts_with("https://blog.example.com"));
+    assert!(book["favicon"]
+        .as_str()
+        .expect("favicon")
+        .starts_with("https://blog.example.com"));
     assert!(!book["excerpt"].as_str().expect("excerpt").is_empty());
     assert!(book["word_count"].as_i64().expect("count") > 20);
 
     // The article body is searchable and the nav/footer chrome was dropped.
-    let resp = send(&app, bare_request("GET", "/api/books?q=recognition", Some(&cookie))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", "/api/books?q=recognition", Some(&cookie)),
+    )
+    .await;
     let hits = body_json(resp).await;
-    assert!(hits.as_array().expect("array").iter().any(|b| b["source"] == "html"));
+    assert!(hits
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|b| b["source"] == "html"));
 }
 
 #[tokio::test]
@@ -1927,7 +2178,10 @@ async fn import_url_rejects_private_and_local_addresses() {
     // IPv6 forms fail it.
     use std::net::IpAddr;
     for ip in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
-        assert!(flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should be global");
+        assert!(
+            flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()),
+            "{ip} should be global"
+        );
     }
     for ip in [
         "127.0.0.1",
@@ -1943,7 +2197,10 @@ async fn import_url_rejects_private_and_local_addresses() {
         "fc00::1",
         "0.0.0.0",
     ] {
-        assert!(!flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()), "{ip} should NOT be global");
+        assert!(
+            !flick_server::import::ip_is_global(&ip.parse::<IpAddr>().unwrap()),
+            "{ip} should NOT be global"
+        );
     }
 
     // The endpoint surfaces the guard as a 400 (no outbound request made).
@@ -1951,7 +2208,12 @@ async fn import_url_rejects_private_and_local_addresses() {
     let cookie = register(&app, "ssrf@example.com").await;
     let resp = send(
         &app,
-        json_request("POST", "/api/import/url", Some(&cookie), json!({"url": "http://127.0.0.1/admin"})),
+        json_request(
+            "POST",
+            "/api/import/url",
+            Some(&cookie),
+            json!({"url": "http://127.0.0.1/admin"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1972,15 +2234,34 @@ async fn text_paragraphs_flatten_to_timeline() {
     .await;
     let id = book["id"].as_str().expect("id").to_string();
 
-    let text = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie))).await).await;
+    let text = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let flat: Vec<String> = text["paragraphs"]
         .as_array()
         .expect("paragraphs")
         .iter()
-        .flat_map(|p| p.as_array().expect("para").iter().map(|w| w.as_str().expect("word").to_string()))
+        .flat_map(|p| {
+            p.as_array()
+                .expect("para")
+                .iter()
+                .map(|w| w.as_str().expect("word").to_string())
+        })
         .collect();
 
-    let timeline = body_json(send(&app, bare_request("GET", &format!("/api/books/{id}/timeline"), Some(&cookie))).await).await;
+    let timeline = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}/timeline"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
     let tl_words: Vec<String> = timeline["words"]
         .as_array()
         .expect("words")
@@ -1988,8 +2269,14 @@ async fn text_paragraphs_flatten_to_timeline() {
         .map(|w| w[0].as_str().expect("text").to_string())
         .collect();
 
-    assert_eq!(flat, tl_words, "flattened text must equal the timeline word order");
-    assert_eq!(flat.len() as i64, book["word_count"].as_i64().expect("count"));
+    assert_eq!(
+        flat, tl_words,
+        "flattened text must equal the timeline word order"
+    );
+    assert_eq!(
+        flat.len() as i64,
+        book["word_count"].as_i64().expect("count")
+    );
 }
 
 #[tokio::test]
@@ -1998,12 +2285,34 @@ async fn search_scopes_to_user_and_matches_title_and_body() {
     let alice = register(&app, "searcha@example.com").await;
     let bob = register(&app, "searchb@example.com").await;
 
-    create_paste_book(&app, &alice, Some("Astronomy Notes"), "The telescope revealed distant nebulae.").await;
-    create_paste_book(&app, &alice, Some("Cooking"), "A recipe for sourdough bread.").await;
-    create_paste_book(&app, &bob, Some("Astronomy Secrets"), "Bob's private telescope notes.").await;
+    create_paste_book(
+        &app,
+        &alice,
+        Some("Astronomy Notes"),
+        "The telescope revealed distant nebulae.",
+    )
+    .await;
+    create_paste_book(
+        &app,
+        &alice,
+        Some("Cooking"),
+        "A recipe for sourdough bread.",
+    )
+    .await;
+    create_paste_book(
+        &app,
+        &bob,
+        Some("Astronomy Secrets"),
+        "Bob's private telescope notes.",
+    )
+    .await;
 
     // Match by title word.
-    let resp = send(&app, bare_request("GET", "/api/books?q=astronomy", Some(&alice))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", "/api/books?q=astronomy", Some(&alice)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let hits = body_json(resp).await;
     let hits = hits.as_array().expect("array");
@@ -2011,7 +2320,11 @@ async fn search_scopes_to_user_and_matches_title_and_body() {
     assert_eq!(hits[0]["title"], "Astronomy Notes");
 
     // Match by body word, still scoped to Alice (Bob's telescope book excluded).
-    let resp = send(&app, bare_request("GET", "/api/books?q=telescope", Some(&alice))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", "/api/books?q=telescope", Some(&alice)),
+    )
+    .await;
     let hits = body_json(resp).await;
     let hits = hits.as_array().expect("array");
     assert_eq!(hits.len(), 1);
@@ -2022,7 +2335,11 @@ async fn search_scopes_to_user_and_matches_title_and_body() {
     assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(12));
 
     // A no-op / punctuation-only query returns an empty list, never a 500.
-    let resp = send(&app, bare_request("GET", "/api/books?q=%20%2A%2A%2A", Some(&alice))).await;
+    let resp = send(
+        &app,
+        bare_request("GET", "/api/books?q=%20%2A%2A%2A", Some(&alice)),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await.as_array().map(Vec::len), Some(0));
 }
@@ -2034,7 +2351,10 @@ async fn integrations_null_and_configured() {
     let resp = send(&app, bare_request("GET", "/api/integrations", None)).await;
     assert_eq!(resp.status(), StatusCode::OK); // public, no auth
     let body = body_json(resp).await;
-    assert_eq!(body, json!({"dropbox": Value::Null, "google_picker": Value::Null}));
+    assert_eq!(
+        body,
+        json!({"dropbox": Value::Null, "google_picker": Value::Null})
+    );
 
     // Dropbox key alone lights up Dropbox; Google needs BOTH client id + api key.
     let (app, _dir) = test_app_with_config(|c| {
@@ -2047,7 +2367,10 @@ async fn integrations_null_and_configured() {
     });
     let body = body_json(send(&app, bare_request("GET", "/api/integrations", None)).await).await;
     assert_eq!(body["dropbox"], json!({"app_key": "dbx-key-123"}));
-    assert_eq!(body["google_picker"], json!({"client_id": "goog-client", "api_key": "picker-api-key"}));
+    assert_eq!(
+        body["google_picker"],
+        json!({"client_id": "goog-client", "api_key": "picker-api-key"})
+    );
 
     // Google client id present but no picker api key → google_picker stays null.
     let (app, _dir) = test_app_with_config(|c| {
@@ -2106,7 +2429,12 @@ async fn hosted_free_plan_enforces_weekly_upload_limit() {
     // The 16th is refused with the contract shape: {"error", "code"}.
     let resp = send(
         &app,
-        json_request("POST", "/api/books", Some(&cookie), json!({"text": "one more"})),
+        json_request(
+            "POST",
+            "/api/books",
+            Some(&cookie),
+            json!({"text": "one more"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2144,7 +2472,11 @@ async fn hosted_free_plan_enforces_weekly_upload_limit() {
     // The counter derives from `books`, so deleting one refunds the upload.
     let resp = send(
         &app,
-        bare_request("DELETE", &format!("/api/books/{last_book_id}"), Some(&cookie)),
+        bare_request(
+            "DELETE",
+            &format!("/api/books/{last_book_id}"),
+            Some(&cookie),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -2170,7 +2502,12 @@ async fn hosted_guests_are_limited_too() {
     // ... and the 16th is the same 403 as for registered users.
     let resp = send(
         &app,
-        json_request("POST", "/api/books", Some(&cookie), json!({"text": "over quota"})),
+        json_request(
+            "POST",
+            "/api/books",
+            Some(&cookie),
+            json!({"text": "over quota"}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);

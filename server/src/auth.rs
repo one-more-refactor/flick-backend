@@ -238,8 +238,7 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token =
-            cookie_value(&parts.headers, SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
+        let token = cookie_value(&parts.headers, SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
         let now = now_secs();
         let user = state
             .db
@@ -500,10 +499,7 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
-    let user = state
-        .db
-        .call(move |c| db::user_by_email(c, &email))
-        .await?;
+    let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
     // reveal whether the email exists (or is an SSO-only account).

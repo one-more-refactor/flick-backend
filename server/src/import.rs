@@ -187,7 +187,9 @@ fn decode_entities(s: &str) -> String {
                     "ldquo" => Some('\u{201C}'),
                     "rdquo" => Some('\u{201D}'),
                     num if num.starts_with("#x") || num.starts_with("#X") => {
-                        u32::from_str_radix(&num[2..], 16).ok().and_then(char::from_u32)
+                        u32::from_str_radix(&num[2..], 16)
+                            .ok()
+                            .and_then(char::from_u32)
                     }
                     num if num.starts_with('#') => {
                         num[1..].parse::<u32>().ok().and_then(char::from_u32)
@@ -256,11 +258,7 @@ pub fn parse_clippings(input: &str) -> Option<Prepared> {
         };
         // Drop the metadata line ("- Your Highlight ...").
         let _meta = lines.next();
-        let body = lines
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
+        let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
         if body.is_empty() {
             continue;
         }
@@ -331,9 +329,7 @@ pub async fn extract_epub(bytes: Vec<u8>) -> Result<Prepared, AppError> {
     .map_err(AppError::internal)?;
     match parsed {
         Ok(Some(prepared)) => Ok(prepared),
-        _ => Err(AppError::bad_request(
-            "could not read this EPUB file",
-        )),
+        _ => Err(AppError::bad_request("could not read this EPUB file")),
     }
 }
 
@@ -407,7 +403,9 @@ pub async fn extract_article(
         excerpt: excerpt_of(&text),
         text,
         source,
-        author: byline.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()),
+        author: byline
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty()),
         url: Some(url),
         favicon,
         category: Some("article".into()),
@@ -500,7 +498,9 @@ fn ipv6_is_global(ip: &std::net::Ipv6Addr) -> bool {
     let seg0 = ip.segments()[0];
     // fc00::/7 unique-local, fe80::/10 link-local, and the 2001:db8::/32
     // documentation block.
-    if (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80 || seg0 == 0x2001 && ip.segments()[1] == 0x0db8
+    if (seg0 & 0xfe00) == 0xfc00
+        || (seg0 & 0xffc0) == 0xfe80
+        || seg0 == 0x2001 && ip.segments()[1] == 0x0db8
     {
         return false;
     }
@@ -516,7 +516,9 @@ pub async fn guarded_fetch(raw_url: &str) -> Result<(String, Vec<u8>, String), A
 
     for _ in 0..=MAX_REDIRECTS {
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(AppError::bad_request("only http and https URLs are allowed"));
+            return Err(AppError::bad_request(
+                "only http and https URLs are allowed",
+            ));
         }
         let host = url
             .host_str()

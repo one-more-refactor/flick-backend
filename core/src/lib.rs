@@ -301,11 +301,7 @@ fn tokenize(text: &str) -> Vec<TimelineWord> {
 pub fn paragraphs(text: &str) -> Vec<Vec<String>> {
     split_paragraphs(text)
         .iter()
-        .map(|para| {
-            para.split_whitespace()
-                .flat_map(display_tokens)
-                .collect()
-        })
+        .map(|para| para.split_whitespace().flat_map(display_tokens).collect())
         .collect()
 }
 
@@ -488,7 +484,15 @@ mod tests {
         let para = raw_weight("word.", "word.", Lang::En, true, true, 5, false);
         assert!(plain < clause && clause < sentence && sentence < para);
         // Closing quote after the period still counts as sentence-final.
-        let quoted = raw_weight("word.\u{201D}", "word.\u{201D}", Lang::En, false, true, 5, false);
+        let quoted = raw_weight(
+            "word.\u{201D}",
+            "word.\u{201D}",
+            Lang::En,
+            false,
+            true,
+            5,
+            false,
+        );
         assert_eq!(quoted, sentence);
         // Long sentences earn a bigger wrap-up (scaled, Spritz-style).
         let long_sent = raw_weight("word.", "word.", Lang::En, false, true, 15, false);
@@ -525,7 +529,10 @@ mod tests {
         assert!(chunks.last().unwrap().ends_with('.'));
         // Short words never split.
         assert_eq!(display_tokens("word."), vec!["word.".to_string()]);
-        assert_eq!(display_tokens("incomprehensib"), vec!["incomprehensib".to_string()]);
+        assert_eq!(
+            display_tokens("incomprehensib"),
+            vec!["incomprehensib".to_string()]
+        );
     }
 
     #[test]

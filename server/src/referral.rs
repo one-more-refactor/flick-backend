@@ -50,7 +50,9 @@ pub async fn status(
         .db
         .call(move |c| {
             let code = db::ensure_ref_code(c, &uid, &fresh)?;
-            let event = db::active_events(c, Some("referral"), now)?.into_iter().next();
+            let event = db::active_events(c, Some("referral"), now)?
+                .into_iter()
+                .next();
             let my_ip = db::user_signup_ip(c, &uid)?;
             let children = db::referral_children(c, &uid)?;
             let mut invited = 0i64;
@@ -159,7 +161,9 @@ pub async fn admin_create(
 ) -> Result<Response, AppError> {
     require_admin(&state, &headers)?;
     if !EVENT_KINDS.contains(&body.kind.as_str()) {
-        return Err(AppError::bad_request("kind must be referral | free_pro | promo"));
+        return Err(AppError::bad_request(
+            "kind must be referral | free_pro | promo",
+        ));
     }
     if body.ends_at <= body.starts_at {
         return Err(AppError::bad_request("ends_at must be after starts_at"));

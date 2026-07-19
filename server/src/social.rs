@@ -190,7 +190,11 @@ pub async fn wrapped(
             let mut months = [0i64; 13];
             let mut weekdays = [0i64; 7];
             for (d, w) in &days {
-                if let Some(m) = d[5..7].parse::<usize>().ok().filter(|m| (1..=12).contains(m)) {
+                if let Some(m) = d[5..7]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|m| (1..=12).contains(m))
+                {
                     months[m] += w;
                 }
                 if let Some(ed) = parse_day(d) {

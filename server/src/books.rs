@@ -76,7 +76,9 @@ fn default_title(text: &str) -> String {
 }
 
 fn clean_title(title: Option<String>) -> Option<String> {
-    title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+    title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 // ------------------------------------------------------------ starter book
@@ -110,9 +112,8 @@ Happy flicking.";
 /// every new non-guest user starts with one; `source: \"intro\"`).
 pub fn seed_intro_book(c: &rusqlite::Connection, user_id: &str, now: i64) -> rusqlite::Result<()> {
     let timeline = Timeline::from_text(INTRO_TEXT);
-    let timeline_json = serde_json::to_vec(&timeline).map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-    })?;
+    let timeline_json = serde_json::to_vec(&timeline)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let book = Book {
         id: random_token(16),
         title: INTRO_TITLE.into(),
@@ -190,12 +191,7 @@ pub async fn list(
                 // A malformed MATCH is the client's problem, never a 500.
                 .map_err(|_| AppError::bad_request("invalid search query"))?
         }
-        _ => {
-            state
-                .db
-                .call(move |c| db::list_books(c, &user.id))
-                .await?
-        }
+        _ => state.db.call(move |c| db::list_books(c, &user.id)).await?,
     };
     Ok(Json(books))
 }
@@ -546,11 +542,7 @@ pub async fn timeline(
         .call(move |c| db::get_timeline(c, &user.id, &id))
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/json")],
-        blob,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "application/json")], blob).into_response())
 }
 
 /// GET /api/books/:id/text — the book as paragraphs of words, whose flattened
@@ -599,9 +591,7 @@ pub async fn set_position(
             if (epoch_days - crate::stats::today_epoch_days()).abs()
                 > crate::stats::MAX_DAY_SKEW_DAYS
             {
-                return Err(AppError::bad_request(
-                    "day is too far from the server date",
-                ));
+                return Err(AppError::bad_request("day is too far from the server date"));
             }
             day
         }
@@ -848,8 +838,8 @@ pub async fn shared_import(
             if mode == "read" {
                 return Ok(Some(Err(())));
             }
-            let timeline = db::get_timeline(c, &owner_id, &src.id)?
-                .expect("shared book has a timeline");
+            let timeline =
+                db::get_timeline(c, &owner_id, &src.id)?.expect("shared book has a timeline");
             let text = db::book_text(c, &owner_id, &src.id)?;
             let copy = Book {
                 id: random_token(16),

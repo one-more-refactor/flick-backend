@@ -75,10 +75,7 @@ async fn api_not_found() -> AppError {
 }
 
 async fn api_method_not_allowed() -> AppError {
-    AppError::Status(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "method not allowed".into(),
-    )
+    AppError::Status(StatusCode::METHOD_NOT_ALLOWED, "method not allowed".into())
 }
 
 /// Cache policy for the static web client: hashed assets are immutable,
@@ -164,7 +161,10 @@ fn api_router() -> Router<AppState> {
         )
         .route("/referral", get(referral::status))
         .route("/events/active", get(referral::active))
-        .route("/admin/events", get(referral::admin_list).post(referral::admin_create))
+        .route(
+            "/admin/events",
+            get(referral::admin_list).post(referral::admin_create),
+        )
         .route("/admin/events/{id}", delete(referral::admin_delete))
         .route("/friends", get(social::list))
         .route("/friends/link", get(social::link))
@@ -185,9 +185,8 @@ pub fn app(state: AppState) -> Router {
 
     let index = state.config.web_dist.join("index.html");
     let router = if index.is_file() {
-        router.fallback_service(
-            ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)),
-        )
+        router
+            .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
     } else {
         router.fallback(no_web_dist)
     };
