@@ -22,6 +22,60 @@ The Rust backend for [**flick**](https://github.com/one-more-refactor/flick): th
 
 **`server/`** (`flick-server`) — axum + SQLite (bundled rusqlite, WAL, versioned migrations — no external DB). Guest sessions, argon2id passwords, email login codes, OIDC/OAuth; a guest's library **merges** into their new account on signup. Brotli/gzip response compression. IPs pseudonymised before storage; GDPR delete + export are first-class endpoints.
 
+## Data model
+
+One SQLite file (WAL, bundled rusqlite, `PRAGMA user_version` migrations — v10 today). FK cascades make account deletion total:
+
+```mermaid
+erDiagram
+    users ||--o{ books : owns
+    users ||--o{ reading_days : "streak / goal"
+    users ||--o{ sessions_log : "per-read stats"
+    users ||--o{ identities : "oauth / oidc"
+    users ||--o{ friends : ""
+    users ||--o{ admin_sessions : "panel logins (v10)"
+    books ||--o| books_fts : "FTS5"
+
+    users {
+        text id PK
+        text email "null for guests"
+        text password_hash "argon2id"
+        int  guest
+        int  is_admin
+        text plan
+    }
+    books {
+        text id PK
+        text user_id FK
+        text title
+        text text "stored source"
+        int  position
+        int  deleted_at "soft trash"
+    }
+```
+
+## Auth, in one picture
+
+Readers use cookie sessions; the admin panel is bearer-only on its own origin:
+
+```mermaid
+sequenceDiagram
+    participant W as flick-web
+    participant A as flick-admin
+    participant S as flick-server
+
+    W->>S: POST /api/auth/guest
+    S-->>W: Set-Cookie flick_session (guest)
+    W->>S: POST /api/auth/register (same session)
+    Note over S: merge_guest_into — library + progress follow
+    S-->>W: Set-Cookie flick_session (account)
+
+    A->>S: POST /api/admin/login {email, password}
+    Note over S: is_admin only · argon2 verify<br/>with dummy-hash timing defense
+    S-->>A: bearer token (sha256-stored, 12 h)
+    A->>S: GET /api/admin/overview · Authorization: Bearer …
+```
+
 ## Run it
 
 ```sh
