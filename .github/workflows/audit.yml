@@ -5,11 +5,21 @@ on:
   workflow_dispatch:
   push:
     paths: ["Cargo.lock", ".cargo/audit.toml"]
+permissions:
+  contents: read
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      # Run cargo-audit directly rather than rustsec/audit-check: that action
+      # posts a Check Run via the API, which the org's read-only workflow token
+      # can't create ("Resource not accessible by integration") — so it failed
+      # every run despite finding nothing. This fails ONLY on vulnerabilities,
+      # and honours .cargo/audit.toml (the RUSTSEC-2023-0071 ignore). Purely
+      # informational advisories (e.g. an unmaintained transitive crate) don't
+      # break the build.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
