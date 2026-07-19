@@ -324,6 +324,14 @@ pub async fn announcement_put(
     if body.text.len() > 300 || body.link.len() > 300 || body.label.len() > 60 {
         return Err(AppError::bad_request("announcement too long"));
     }
+    // The link is rendered as an <a href> for every visitor — never let a
+    // javascript:/data: URL through, even from an admin.
+    if !body.link.is_empty()
+        && !body.link.starts_with("https://")
+        && !body.link.starts_with("http://")
+    {
+        return Err(AppError::bad_request("link must be http(s)"));
+    }
     let now = now_secs();
     state
         .db

@@ -1,0 +1,7 @@
+# cargo-audit policy. RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`)
+# reaches us only through openidconnect, which uses RSA exclusively to VERIFY
+# identity-provider JWT signatures — a public-key operation. flick never
+# performs RSA private-key operations, so the attack has no target here.
+# Re-evaluate if a fixed rsa release lands or openidconnect changes usage.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

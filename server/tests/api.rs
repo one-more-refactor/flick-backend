@@ -2864,6 +2864,19 @@ async fn admin_full_flow() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    // Announcement links must be http(s) — no javascript:/data: schemes.
+    let resp = send(
+        &app,
+        bearer_request(
+            "PUT",
+            "/api/admin/announcement",
+            &s_token,
+            Some(json!({"text": "x", "link": "javascript:alert(1)", "active": true})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // Announcement publishes into /api/meta and clears again.
     let meta = body_json(send(&app, bare_request("GET", "/api/meta", None)).await).await;
     assert!(meta["announcement"].is_null());
