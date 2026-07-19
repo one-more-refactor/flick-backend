@@ -865,7 +865,7 @@ dependencies = [
  "lettre",
  "openidconnect",
  "pdf-extract",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rbook",
  "reqwest",
  "rusqlite",

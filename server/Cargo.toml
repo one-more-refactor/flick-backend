@@ -12,7 +12,7 @@ flick-core = { path = "../core" }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder", "hostname"] }
 openidconnect = "4"
 pdf-extract = "0.12.0"
-rand = "0.8"
+rand = "0.10"
 rbook = "0.7"
 # reqwest is already in the tree (via openidconnect); pull it in directly with
 # rustls only — no native-tls/openssl. The body is capped via `Response::chunk`
