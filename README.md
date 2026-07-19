@@ -1,11 +1,11 @@
 # flick-backend
 
-The Rust backend for [**flick**](https://github.com/one-more-refactor/flick) — the reading engine and the API server.
+[![ci](https://github.com/one-more-refactor/flick-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/one-more-refactor/flick-backend/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/one-more-refactor/flick-backend?labelColor=111111&color=d32f2f)](https://github.com/one-more-refactor/flick-backend/releases/latest)
+[![commits since](https://img.shields.io/github/commits-since/one-more-refactor/flick-backend/latest?labelColor=111111&color=d32f2f)](https://github.com/one-more-refactor/flick-backend/compare)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-d32f2f?labelColor=111111)](LICENSE)
 
-- **`core/`** (`flick-core`) — the speed-reading engine. Pure, deterministic, no I/O: it turns text into a paced stream of RSVP words with Optimal-Recognition-Point (ORP) alignment. Fully unit-tested.
-- **`server/`** (`flick-server`) — an [axum](https://github.com/tokio-rs/axum) HTTP server. Exposes the JSON API under `/api`, persists to SQLite, and (optionally) serves the built web client at `/`.
-
-It speaks one contract: [`docs/CONTRACTS.md`](https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md) in the umbrella repo. Every client — the [web app](https://github.com/one-more-refactor/flick-web), a future browser extension — talks to this API and nothing else.
+The Rust backend for [**flick**](https://github.com/one-more-refactor/flick): the reading engine and the API server. One contract — [`CONTRACTS.md`](https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md) — every client talks to this API and nothing else.
 
 ```
 ┌──────────────┐   HTTP/JSON (/api)   ┌───────────────────────────┐
@@ -18,67 +18,42 @@ It speaks one contract: [`docs/CONTRACTS.md`](https://github.com/one-more-refact
                                        └───────────────────────────┘
 ```
 
-## The engine (`flick-core`)
+**`core/`** (`flick-core`) — the engine. Pure, deterministic, no I/O. It doesn't just flash words, it paces them: ORP pivot alignment, Zipf-frequency weighting (rare words get more time), long-word chunking, wrap-up pauses at clause and sentence ends.
 
-flick doesn't just flash words — it paces them. Each word's dwell time is derived from a research-grounded model:
+**`server/`** (`flick-server`) — axum + SQLite (bundled rusqlite, WAL, versioned migrations — no external DB). Guest sessions, argon2id passwords, email login codes, OIDC/OAuth; a guest's library **merges** into their new account on signup. Brotli/gzip response compression. IPs pseudonymised before storage; GDPR delete + export are first-class endpoints.
 
-- **ORP alignment** — every word is split at its Optimal Recognition Point (the pivot your eye should land on) and rendered so that pivot stays fixed. No saccades, no line-tracking.
-- **Frequency weighting** — rarer words (low [Zipf](https://en.wikipedia.org/wiki/Zipf%27s_law) frequency) get more time; common ones flick by.
-- **Length grading & long-word splitting** — long tokens are chunked; each chunk earns its own dwell.
-- **Wrap-up pauses** — sentence- and clause-final punctuation gets a beat, so meaning lands.
-
-The engine is pure and deterministic, which means it's testable: `cargo test -p flick-core`.
-
-## The server (`flick-server`)
-
-- **SQLite** via `rusqlite` (bundled, WAL) — schema migrations are versioned with `PRAGMA user_version`. No external database.
-- **Auth** — guest sessions (no signup), argon2id passwords, 6-digit email login codes, and OIDC / OAuth (Google, GitHub). Cookie sessions. On sign-up, a guest's library and progress **merge** into the new account.
-- **Privacy by default** — client IPs are pseudonymised before they touch storage; account deletion (GDPR Art. 17) and data export (Art. 15/20) are first-class endpoints.
-- **Editions** — `FLICK_EDITION=selfhost` (everything free, nothing metered) or `hosted` (Free / Pro).
-
-### Run it
+## Run it
 
 ```sh
-# from source
-cargo run --release -p flick-server
-
-# or the production image (backend + web client baked in)
-podman build -t flick-backend -f deploy/Containerfile .   # run from a checkout that has web/ — see the umbrella repo
+cargo run --release -p flick-server              # from source
+podman build -t flick-backend -f deploy/Containerfile .   # prod image (web client baked in)
 ```
 
-Self-hosting the whole thing (backend + web) is one command — see [**flick › Self-hosting**](https://github.com/one-more-refactor/flick#self-hosting).
+Self-hosting everything is one command — see [**flick › Self-hosting**](https://github.com/one-more-refactor/flick#self-hosting).
 
-### Configuration
+## Configuration
 
-All config is environment variables (full list in [`CONTRACTS.md`](https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md)):
+Environment variables (full list in [`CONTRACTS.md`](https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md)):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FLICK_EDITION` | `selfhost` | `selfhost` or `hosted` |
+| `FLICK_EDITION` | `selfhost` | `selfhost` (all free) or `hosted` |
 | `FLICK_ADDR` | `0.0.0.0:8484` | bind address |
 | `FLICK_DATA_DIR` | `./data` | SQLite lives here |
-| `FLICK_PUBLIC_URL` | `http://localhost:8484` | canonical URL (OAuth redirects, share links) |
-| `FLICK_WEB_DIST` | auto | path to the built web client to serve at `/` |
-| `FLICK_SMTP_URL` | — | SMTP for login-code email; if unset, codes are logged (dev) |
+| `FLICK_PUBLIC_URL` | `http://localhost:8484` | canonical URL |
+| `FLICK_WEB_DIST` | auto | built web client, served at `/` |
+| `FLICK_SMTP_URL` | — | login-code email; unset = codes logged |
 | `FLICK_OIDC_*`, `FLICK_OAUTH_*` | — | SSO providers |
 | `FLICK_ADMIN_TOKEN` | — | enables admin endpoints |
 
-## Layout
-
-```
-core/          flick-core — the reading engine (lib, no I/O)
-server/        flick-server — axum API + static web serving
-deploy/        Containerfile + Quadlet units for rootless podman
-Cargo.toml     workspace
-```
-
-## Tests
+## Verify
 
 ```sh
-cargo test          # core + server
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace && cargo clippy --all-targets -- -D warnings
 ```
+
+Releases: bump the crate versions, tag `vX.Y.Z`, push the tag — CI verifies tag = manifest, runs the suite, and publishes the release.
 
 ## License
 
-[AGPL-3.0-only](LICENSE). If you run a modified version as a network service, you must offer users its source (§13).
+[AGPL-3.0-only](LICENSE). Run a modified network service → offer users its source (§13).
