@@ -10,6 +10,9 @@ Wants=network-online.target
 [Container]
 Image=localhost/flick-backend:latest
 ContainerName=flick-backend
+# Shared bridge so the flick-admin container can proxy /api to this one by
+# name (see flick-admin's deploy/flick.network).
+Network=flick.network
 # Loopback only — Cloudflare Tunnel reaches this; no public port is exposed.
 PublishPort=127.0.0.1:3011:8484
 Volume=flick-data:/data
@@ -19,6 +22,10 @@ Environment=FLICK_ADDR=0.0.0.0:8484
 Environment=FLICK_DATA_DIR=/data
 # Set a real admin token on the host; keep it out of git.
 Environment=FLICK_ADMIN_TOKEN=CHANGE_ME
+# The admin panel (flick-admin, port 3013): the ADMIN link in the user app,
+# and CORS only if the panel is served from its own origin un-proxied.
+Environment=FLICK_ADMIN_URL=https://admin.myflick.app
+# Environment=FLICK_ADMIN_ORIGIN=https://admin.myflick.app
 # Email login codes are logged until SMTP is configured; password auth works today.
 # Environment=FLICK_SMTP_URL=smtps://user:pass@smtp.host:465
 # Environment=FLICK_SMTP_FROM=flick <no-reply@myflick.app>
