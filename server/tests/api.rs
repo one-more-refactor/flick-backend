@@ -2714,6 +2714,41 @@ async fn xff_from_public_peer_is_ignored() {
     }
 }
 
+#[tokio::test]
+async fn xff_spoofed_is_ignored() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    // A client at real IP 203.0.113.7 attempts to spoof different prepended IPs
+    // in X-Forwarded-For (e.g. "1.1.1.1, 203.0.113.7" and "2.2.2.2, 203.0.113.7")
+    // behind a trusted proxy (Caddy).
+    // The rate limiter must recognize the real client IP (203.0.113.7) and
+    // enforce the limit after 2 requests.
+    for (i, spoof_header) in [
+        "1.1.1.1, 203.0.113.7",
+        "2.2.2.2, 203.0.113.7",
+        "3.3.3.3, 203.0.113.7",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = send(
+            &app,
+            with_peer(login_request(Some(spoof_header)), "127.0.0.1:9999"),
+        )
+        .await;
+        let expect = if i < 2 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(resp.status(), expect, "request {i}");
+    }
+}
+
 // ------------------------------------------------------------------ admin
 
 fn bearer_request(method: &str, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {

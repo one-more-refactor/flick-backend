@@ -173,19 +173,26 @@ fn trusted_proxy(ip: IpAddr) -> bool {
     }
 }
 
-/// The FIRST entry of the first X-Forwarded-For header, if it parses as an
-/// IP. Caddy overwrites/appends the header itself, so with exactly one proxy
-/// in front the first entry is the real client.
+/// Parse the X-Forwarded-For header securely.
+/// To prevent IP spoofing, we traverse the IPs from right to left (most recent proxy to oldest),
+/// skipping any trusted proxies, and return the first non-trusted IP we find.
+/// If all parsed IPs are trusted proxies, we fall back to the rightmost IP address.
 fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    headers
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let mut ips = Vec::new();
+    for part in xff.split(',') {
+        if let Ok(ip) = part.trim().parse::<IpAddr>() {
+            ips.push(ip);
+        }
+    }
+    // Traverse from right to left, skipping trusted proxies
+    for ip in ips.iter().rev() {
+        if !trusted_proxy(*ip) {
+            return Some(*ip);
+        }
+    }
+    // Fallback to the rightmost IP if all are trusted proxies
+    ips.last().copied()
 }
 
 /// Infallible extractor: the request's client IP under the same trust rules
