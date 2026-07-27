@@ -2,13 +2,25 @@
 # Install: copy to ~/.config/containers/systemd/ then
 #   systemctl --user daemon-reload && systemctl --user start flick-backend
 # Requires: `loginctl enable-linger $USER` so it runs without an active login.
+#
+# Auto-update: the image comes from ghcr, published by release.yml on every v*
+# tag (multi-arch: amd64 + arm64). Enable the timer once per host:
+#   systemctl --user enable --now podman-auto-update.timer
+# It then checks daily and restarts this unit only when the digest changed.
+#   podman auto-update --dry-run   # show what would change
+#   podman auto-update             # apply now
+#   podman auto-update rollback    # revert to the previous image if it broke
+# Pull-based: nothing inbound is required — no SSH exposure, no runner on the box.
 [Unit]
 Description=flick backend (hosted edition)
 After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=localhost/flick-backend:latest
+Image=ghcr.io/one-more-refactor/flick-backend:latest
+# Track the registry digest; podman-auto-update pulls and restarts on change.
+# Pin to a version tag instead (e.g. :v0.9.0) to freeze this host.
+AutoUpdate=registry
 ContainerName=flick-backend
 # Shared bridge so the flick-admin container can proxy /api to this one by
 # name (see flick-admin's deploy/flick.network).
