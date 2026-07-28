@@ -2714,6 +2714,73 @@ async fn xff_from_public_peer_is_ignored() {
     }
 }
 
+/// Behind a trusted proxy, prepending junk to X-Forwarded-For must not buy a
+/// fresh bucket. Proxies append, so the rightmost non-trusted entry is the
+/// real client; reading the leftmost let anyone choose their own key.
+#[tokio::test]
+async fn xff_prepend_does_not_reset_the_bucket() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    // Real client 203.0.113.7, one trusted proxy hop, attacker-chosen prefix.
+    for (i, spoof) in [
+        "1.1.1.1, 203.0.113.7",
+        "2.2.2.2, 203.0.113.7",
+        "3.3.3.3, 203.0.113.7",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = send(&app, with_peer(login_request(Some(spoof)), "127.0.0.1:4433")).await;
+        let expect = if i < 2 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(resp.status(), expect, "request {i}");
+    }
+}
+
+/// In the tunnel topology the peer is loopback and `cloudflared` sets no XFF
+/// at all, so an X-Forwarded-For on such a request is pure client input.
+/// CF-Connecting-IP is what the edge actually sets — it must win.
+#[tokio::test]
+async fn cf_connecting_ip_beats_a_spoofed_xff() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    for (i, spoof) in ["1.1.1.1", "2.2.2.2", "3.3.3.3"].iter().enumerate() {
+        let mut req = login_request(Some(spoof));
+        req.headers_mut()
+            .insert("cf-connecting-ip", "203.0.113.9".parse().expect("header"));
+        let resp = send(&app, with_peer(req, "127.0.0.1:4433")).await;
+        let expect = if i < 2 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(resp.status(), expect, "request {i}");
+    }
+}
+
+/// The baseline security headers ride on every response.
+#[tokio::test]
+async fn security_headers_are_present() {
+    let (app, _dir) = test_app();
+    let resp = send(&app, bare_request("GET", "/api/meta", None)).await;
+    let h = resp.headers();
+    assert_eq!(h.get("x-content-type-options").expect("nosniff"), "nosniff");
+    assert_eq!(h.get("x-frame-options").expect("frame-options"), "DENY");
+    assert_eq!(h.get("referrer-policy").expect("referrer"), "no-referrer");
+    assert!(h.contains_key("strict-transport-security"));
+}
+
 // ------------------------------------------------------------------ admin
 
 fn bearer_request(method: &str, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {

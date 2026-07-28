@@ -56,6 +56,8 @@ pub struct RateLimits {
     pub import_url: Rule,
     pub friend_add: Rule,
     pub admin_login: Rule,
+    pub delete_me: Rule,
+    pub export: Rule,
 }
 
 impl Default for RateLimits {
@@ -70,6 +72,10 @@ impl Default for RateLimits {
             import_url: Rule::new(30, HOUR),
             friend_add: Rule::new(30, FIVE_MIN),
             admin_login: Rule::new(10, FIVE_MIN),
+            // Authed but destructive/expensive: a stolen cookie should not be
+            // able to erase the account or pull the full export in a loop.
+            delete_me: Rule::new(5, FIVE_MIN),
+            export: Rule::new(10, HOUR),
         }
     }
 }
@@ -79,19 +85,18 @@ impl RateLimits {
     /// Paths are the full ones — the middleware is layered OUTSIDE the `/api`
     /// nest, so the prefix is still present.
     fn rule_for(&self, method: &Method, path: &str) -> Option<(&'static str, Rule)> {
-        if *method != Method::POST {
-            return None;
-        }
-        match path {
-            "/api/auth/login" => Some(("login", self.login)),
-            "/api/auth/register" => Some(("register", self.register)),
-            "/api/auth/code/request" => Some(("code_request", self.code_request)),
-            "/api/auth/code/verify" => Some(("code_verify", self.code_verify)),
-            "/api/auth/lookup" => Some(("lookup", self.lookup)),
-            "/api/auth/guest" => Some(("guest", self.guest)),
-            "/api/import/url" => Some(("import_url", self.import_url)),
-            "/api/friends/add" => Some(("friend_add", self.friend_add)),
-            "/api/admin/login" => Some(("admin_login", self.admin_login)),
+        match (method.as_str(), path) {
+            ("POST", "/api/auth/login") => Some(("login", self.login)),
+            ("POST", "/api/auth/register") => Some(("register", self.register)),
+            ("POST", "/api/auth/code/request") => Some(("code_request", self.code_request)),
+            ("POST", "/api/auth/code/verify") => Some(("code_verify", self.code_verify)),
+            ("POST", "/api/auth/lookup") => Some(("lookup", self.lookup)),
+            ("POST", "/api/auth/guest") => Some(("guest", self.guest)),
+            ("POST", "/api/import/url") => Some(("import_url", self.import_url)),
+            ("POST", "/api/friends/add") => Some(("friend_add", self.friend_add)),
+            ("POST", "/api/admin/login") => Some(("admin_login", self.admin_login)),
+            ("DELETE", "/api/auth/me") => Some(("delete_me", self.delete_me)),
+            ("GET", "/api/auth/export") => Some(("export", self.export)),
             _ => None,
         }
     }
@@ -173,19 +178,50 @@ fn trusted_proxy(ip: IpAddr) -> bool {
     }
 }
 
-/// The FIRST entry of the first X-Forwarded-For header, if it parses as an
-/// IP. Caddy overwrites/appends the header itself, so with exactly one proxy
-/// in front the first entry is the real client.
-fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+/// Cloudflare's edge sets `CF-Connecting-IP` to the real client IP and strips
+/// any client-supplied copy of it. The `cloudflared` tunnel worker connects
+/// over loopback and does *not* set `X-Forwarded-For`, so in the tunnel
+/// topology XFF is nothing but attacker-controlled bytes — prefer this header
+/// and fall back to XFF for the bare-Caddy self-hosted topology.
+fn cf_connecting_ip(headers: &HeaderMap) -> Option<IpAddr> {
     headers
+        .get("cf-connecting-ip")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The real client from X-Forwarded-For.
+///
+/// Read right-to-left: proxies *append*, so the rightmost entries are the ones
+/// added by infrastructure we control and the leftmost is whatever the client
+/// typed. Skip trusted proxies from the right and take the first address that
+/// isn't one — that is the closest hop we did not add ourselves. Taking the
+/// leftmost entry instead (as this did) let any client pick their own rate
+/// limit bucket just by sending the header.
+fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let ips: Vec<IpAddr> = headers
         .get("x-forwarded-for")?
         .to_str()
         .ok()?
         .split(',')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+
+    ips.iter()
+        .rev()
+        .find(|ip| !trusted_proxy(**ip))
+        .copied()
+        // Every hop is one of ours: the rightmost is the best we can do.
+        .or_else(|| ips.last().copied())
+}
+
+/// The client IP behind a peer we already decided to trust. Kept in one place
+/// so the rate limiter and the signup-attribution path cannot drift apart.
+fn client_behind_trusted_peer(headers: &HeaderMap) -> Option<IpAddr> {
+    cf_connecting_ip(headers).or_else(|| forwarded_ip(headers))
 }
 
 /// Infallible extractor: the request's client IP under the same trust rules
@@ -218,7 +254,7 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
         Some(peer) => {
             let peer_ip = peer.ip().to_canonical();
             if trusted_proxy(peer_ip) {
-                if let Some(client) = forwarded_ip(headers) {
+                if let Some(client) = client_behind_trusted_peer(headers) {
                     return client.to_canonical().to_string();
                 }
             }
@@ -238,7 +274,7 @@ fn client_key(req: &Request) -> String {
     // Canonicalize so an IPv4-mapped ::ffff:a.b.c.d peer matches the v4 rules.
     let peer_ip = peer.ip().to_canonical();
     if trusted_proxy(peer_ip) {
-        if let Some(client) = forwarded_ip(req.headers()) {
+        if let Some(client) = client_behind_trusted_peer(req.headers()) {
             return client.to_canonical().to_string();
         }
     }

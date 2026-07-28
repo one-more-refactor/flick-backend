@@ -105,6 +105,33 @@ async fn cache_control(req: Request, next: Next) -> Response {
     res
 }
 
+/// Security headers on every response, API and static alike.
+///
+/// The Cloudflare edge can add these too, but setting them at the origin keeps
+/// one source of truth and means a bare self-hosted deployment behind plain
+/// Caddy gets them as well.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    // One year, but no `includeSubDomains`: the apex and the app/admin
+    // subdomains are not all guaranteed to be HTTPS-only forever, and this
+    // header is very hard to walk back once a browser has pinned it.
+    h.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    res
+}
+
 /// Plain-text fallback when FLICK_WEB_DIST has no built web client.
 async fn no_web_dist(uri: Uri) -> Response {
     let status = if uri.path() == "/" {
@@ -243,6 +270,7 @@ pub fn app(state: AppState) -> Router {
             ratelimit::rate_limit,
         ))
         .layer(middleware::from_fn(cache_control))
+        .layer(middleware::from_fn(security_headers))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
