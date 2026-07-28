@@ -81,7 +81,8 @@ fn hash_ip(ip: &str) -> String {
 
 /// Constant-time equality so code verification can't be timed byte-by-byte.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use subtle::ConstantTimeEq;
+    bool::from(a.ct_eq(b))
 }
 
 /// Extract a cookie value from request headers.

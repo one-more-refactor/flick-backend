@@ -12,6 +12,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use subtle::ConstantTimeEq;
+
 use crate::auth::{random_token, sha256_hex, verify_password, DUMMY_HASH};
 use crate::db::{self, now_secs};
 use crate::error::{AppError, AppJson, AppPath};
@@ -33,12 +35,14 @@ fn bearer(headers: &HeaderMap) -> &str {
         .unwrap_or_default()
 }
 
+/// Secure comparison of administrative bearer tokens.
+/// Hashing both values with SHA-256 produces fixed-length digests (64 hex characters / bytes),
+/// completely eliminating length-based timing leaks. We then use `subtle::ConstantTimeEq`
+/// to perform a timing-invariant byte-by-byte comparison that cannot be optimized away by the compiler.
 fn constant_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    let a_hash = sha256_hex(a);
+    let b_hash = sha256_hex(b);
+    bool::from(a_hash.as_bytes().ct_eq(b_hash.as_bytes()))
 }
 
 /// Authorize an /api/admin request. 404 (not 401) when the admin surface is
