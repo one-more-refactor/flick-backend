@@ -33,14 +33,20 @@ fn bearer(headers: &HeaderMap) -> &str {
         .unwrap_or_default()
 }
 
+/// Compare two secrets without leaking anything through timing — length
+/// included.
+///
+/// `subtle` makes the byte comparison itself constant-time, but returning
+/// early on a length mismatch is its own oracle: someone who can time this
+/// endpoint learns how long `FLICK_ADMIN_TOKEN` is, which is a real head
+/// start on guessing it. Hashing both sides to a fixed 32 bytes first means
+/// the comparison does identical work for every pair of inputs.
 fn constant_eq(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
     use subtle::ConstantTimeEq;
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    a_bytes.ct_eq(b_bytes).unwrap_u8() == 1
+    let a_hash = Sha256::digest(a.as_bytes());
+    let b_hash = Sha256::digest(b.as_bytes());
+    bool::from(a_hash.ct_eq(&b_hash))
 }
 
 /// Authorize an /api/admin request. 404 (not 401) when the admin surface is
