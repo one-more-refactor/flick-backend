@@ -2734,7 +2734,11 @@ async fn xff_prepend_does_not_reset_the_bucket() {
     .iter()
     .enumerate()
     {
-        let resp = send(&app, with_peer(login_request(Some(spoof)), "127.0.0.1:4433")).await;
+        let resp = send(
+            &app,
+            with_peer(login_request(Some(spoof)), "127.0.0.1:4433"),
+        )
+        .await;
         let expect = if i < 2 {
             StatusCode::UNAUTHORIZED
         } else {
