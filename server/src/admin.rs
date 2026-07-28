@@ -34,11 +34,13 @@ fn bearer(headers: &HeaderMap) -> &str {
 }
 
 fn constant_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    use subtle::ConstantTimeEq;
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    a_bytes.ct_eq(b_bytes).unwrap_u8() == 1
 }
 
 /// Authorize an /api/admin request. 404 (not 401) when the admin surface is
