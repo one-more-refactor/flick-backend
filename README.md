@@ -1,9 +1,9 @@
 # flick-backend
 
 [![ci](https://github.com/one-more-refactor/flick-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/one-more-refactor/flick-backend/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/one-more-refactor/flick-backend?labelColor=111111&color=d32f2f)](https://github.com/one-more-refactor/flick-backend/releases/latest)
-[![commits since](https://img.shields.io/github/commits-since/one-more-refactor/flick-backend/latest?labelColor=111111&color=d32f2f)](https://github.com/one-more-refactor/flick-backend/compare)
-[![license](https://img.shields.io/badge/license-AGPL--3.0-d32f2f?labelColor=111111)](LICENSE)
+[![release](https://img.shields.io/github/v/release/one-more-refactor/flick-backend?labelColor=111111&color=f2ede5)](https://github.com/one-more-refactor/flick-backend/releases/latest)
+[![commits since](https://img.shields.io/github/commits-since/one-more-refactor/flick-backend/latest?labelColor=111111&color=f2ede5)](https://github.com/one-more-refactor/flick-backend/compare)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-f2ede5?labelColor=111111)](LICENSE)
 
 The Rust backend for [**flick**](https://github.com/one-more-refactor/flick): the reading engine and the API server. One contract — [`CONTRACTS.md`](https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md) — every client talks to this API and nothing else.
 
