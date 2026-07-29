@@ -94,6 +94,12 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
+        return Err(AppError::bad_request("invalid email address"));
+    }
+    if body.password.len() > 128 {
+        return Err(AppError::bad_request("password too long"));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     let password = body.password;

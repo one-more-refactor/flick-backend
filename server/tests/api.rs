@@ -1871,6 +1871,120 @@ async fn trash_restore_purge_and_tags() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn input_length_limits_and_validation() {
+    let (app, _dir) = test_app();
+
+    // 1. Email validation (too long / missing @ / too short)
+    let bad_emails = [
+        "a".repeat(255) + "@example.com", // > 254 chars
+        "no-at-sign.com".to_string(),
+        "ab".to_string(), // < 3 chars
+    ];
+    for email in bad_emails {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/register",
+                None,
+                json!({"email": email, "password": "password123", "name": "Ada"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "invalid email address");
+    }
+
+    // 2. Password length validation on register
+    // Too short (< 8)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "short", "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("at least 8 characters"));
+
+    // Too long (> 128)
+    let long_pw = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_pw, "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("at most 128 characters"));
+
+    // Name too long (> 100) on register
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "password123", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("at most 100 characters"));
+
+    // 3. Password length validation on login (> 128)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": "p".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "password too long");
+
+    // 4. Name too long (> 100) on update_me (PATCH)
+    let cookie = register(&app, "user-patch@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({
+                "name": "n".repeat(101),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"]
+        .as_str()
+        .unwrap()
+        .contains("at most 100 characters"));
+}
+
 // -------------------------------------------------------- v0.3: catalog
 
 #[tokio::test]
