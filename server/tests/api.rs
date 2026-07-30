@@ -252,6 +252,80 @@ async fn register_login_logout_me_flow() {
 }
 
 #[tokio::test]
+async fn auth_input_validation_constraints() {
+    let (app, _dir) = test_app();
+
+    // 1. Password too long in registration (>128 chars)
+    let long_password = "a".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_password, "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Email too long in registration (>254 chars)
+    let long_email = format!("{}@example.com", "a".repeat(243));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Name too long in registration (>100 chars)
+    let long_name = "a".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid2@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Password too long in login
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": "a".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. Name too long in profile patch (>100 chars)
+    let cookie = register(&app, "patch_validation@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"name": "a".repeat(101)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn duplicate_register_conflicts() {
     let (app, _dir) = test_app();
     register(&app, "dup@example.com").await;
