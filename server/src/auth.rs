@@ -308,6 +308,9 @@ pub async fn lookup(
     AppJson(body): AppJson<LookupBody>,
 ) -> Result<Json<Value>, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > 254 {
+        return Err(AppError::bad_request("email address is too long"));
+    }
     let methods = state
         .db
         .call(move |c| {
@@ -356,6 +359,9 @@ pub async fn code_request(
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > 254 {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let lookup = email.clone();
     let exists = state
         .db
@@ -390,6 +396,9 @@ pub async fn code_verify(
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > 254 || body.code.trim().len() > 128 {
+        return Err(AppError::bad_request("invalid code"));
+    }
     let presented_hash = sha256_hex(body.code.trim());
     let now = now_secs();
     let user = state
@@ -440,9 +449,17 @@ pub async fn register(
     if email.len() < 3 || !email.contains('@') {
         return Err(AppError::bad_request("invalid email address"));
     }
+    if email.len() > 254 {
+        return Err(AppError::bad_request("email address is too long"));
+    }
     if body.password.len() < 8 {
         return Err(AppError::bad_request(
             "password must be at least 8 characters",
+        ));
+    }
+    if body.password.len() > 128 {
+        return Err(AppError::bad_request(
+            "password must be at most 128 characters",
         ));
     }
     // Contract: name is optional — default to the email's local part.
@@ -452,6 +469,9 @@ pub async fn register(
         .filter(|n| !n.is_empty())
         .or_else(|| email.split('@').next().map(str::to_string))
         .unwrap_or_else(|| "reader".into());
+    if name.len() > 100 {
+        return Err(AppError::bad_request("name must be at most 100 characters"));
+    }
 
     let body_ref = body.ref_code.clone();
     let password = body.password;
@@ -505,6 +525,12 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > 254 || body.password.len() > 128 {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
@@ -660,6 +686,9 @@ pub async fn update_me(
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(AppError::bad_request("name must not be empty"));
+        }
+        if name.len() > 100 {
+            return Err(AppError::bad_request("name must be at most 100 characters"));
         }
         user.name = name;
     }

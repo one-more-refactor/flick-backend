@@ -252,6 +252,135 @@ async fn register_login_logout_me_flow() {
 }
 
 #[tokio::test]
+async fn auth_input_validation_limits() {
+    let (app, _dir) = test_app();
+
+    // 1. Register with too long email (>254 chars) -> 400 Bad Request
+    let long_email = format!("{}@example.com", "a".repeat(245));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "email address is too long");
+
+    // 2. Register with too long password (>128 chars) -> 400 Bad Request
+    let long_password = "a".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_password, "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "password must be at most 128 characters"
+    );
+
+    // 3. Register with too long name (>100 chars) -> 400 Bad Request
+    let long_name = "a".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "name must be at most 100 characters"
+    );
+
+    // 4. Login with too long password/email -> 401 Unauthorized
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": "a".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid email or password");
+
+    // 5. Update me with too long name -> 400 Bad Request
+    let cookie = register(&app, "valid@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"name": "a".repeat(101)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "name must be at most 100 characters"
+    );
+
+    // 6. Admin login with too long password -> 401 Unauthorized
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": "a".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 7. Lookup with too long email -> 400 Bad Request
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": "a".repeat(255)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "email address is too long");
+
+    // 8. Code verify with too long password or email -> 400 Bad Request
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "valid@example.com", "code": "a".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid code");
+}
+
+#[tokio::test]
 async fn duplicate_register_conflicts() {
     let (app, _dir) = test_app();
     register(&app, "dup@example.com").await;
