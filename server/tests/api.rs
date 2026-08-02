@@ -688,6 +688,204 @@ async fn patch_me_validation() {
     assert_eq!(me["settings"]["wpm"], 350);
 }
 
+#[tokio::test]
+async fn auth_input_validation() {
+    let (app, _dir) = test_app();
+
+    // 1. Register input validation
+    // Email < 3 chars
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "a@", "password": "password123"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Email > 254 chars
+    let long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": long_email, "password": "password123"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Email without @
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "invalidemail", "password": "password123"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Password < 8 chars
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "test@example.com", "password": "short"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Password > 128 chars
+    let long_password = "a".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "test@example.com", "password": long_password
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Name > 100 chars
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "test@example.com", "password": "password123", "name": long_name
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Login input validation
+    // Email > 254 chars
+    let long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": long_email, "password": "password123"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Password > 128 chars
+    let long_password = "a".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": "test@example.com", "password": long_password
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Lookup input validation
+    // Email > 254 chars
+    let long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({
+                "email": long_email
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Code request validation
+    // Email > 254 chars
+    let long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({
+                "email": long_email
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Code verify validation
+    // Email > 254 chars
+    let long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({
+                "email": long_email, "code": "123456"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 6. Profile update validation
+    let cookie = register(&app, "valid@example.com").await;
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "name": long_name }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // --------------------------------------------------------- v0.3: guests
 
 #[tokio::test]
