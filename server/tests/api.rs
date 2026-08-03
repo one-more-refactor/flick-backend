@@ -1871,6 +1871,138 @@ async fn trash_restore_purge_and_tags() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn test_input_validation_limits() {
+    let (app, _dir) = test_app();
+
+    // 1. register with over-long email (> 254 characters)
+    let long_email = format!("{}@example.com", "a".repeat(243)); // 243 + 12 = 255 chars
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Tester"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid email address");
+
+    // 2. register with over-long password (> 128 characters)
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_password, "name": "Tester"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "password must be between 8 and 128 characters"
+    );
+
+    // 3. register with over-long name (> 100 characters)
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid2@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "display name must be at most 100 characters"
+    );
+
+    // 4. login with over-long email (> 254 characters)
+    let long_email = format!("{}@example.com", "a".repeat(243));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid email or password");
+
+    // 5. login with over-long password (> 128 characters)
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid email or password");
+
+    // 6. update display name with over-long name (> 100 characters)
+    let cookie = register(&app, "valid_user@example.com").await;
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "display name must be at most 100 characters"
+    );
+
+    // 7. admin login with over-long email or password (> 254 / > 128)
+    let long_email = format!("{}@example.com", "a".repeat(243));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // -------------------------------------------------------- v0.3: catalog
 
 #[tokio::test]
