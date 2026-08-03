@@ -24,7 +24,7 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -94,7 +94,12 @@ async fn cache_control(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let mut res = next.run(req).await;
     if !path.starts_with("/api") && res.status().is_success() {
-        let value = if path.starts_with("/assets/") {
+        // /assets/ is the pre-1.1 single-SPA layout; /app/assets/ is the SPA
+        // under the combined layout; /_astro/ is the landing's hashed output.
+        let hashed = path.starts_with("/assets/")
+            || path.starts_with("/app/assets/")
+            || path.starts_with("/_astro/");
+        let value = if hashed {
             "public, max-age=31536000, immutable"
         } else {
             "no-cache"
@@ -130,6 +135,12 @@ async fn security_headers(req: Request, next: Next) -> Response {
         HeaderValue::from_static("max-age=31536000"),
     );
     res
+}
+
+/// Pre-1.1 the SPA owned the site root; its deep links live under /app/ now.
+/// Permanent redirects keep every shared/bookmarked URL working.
+async fn legacy_app_path(uri: Uri) -> Redirect {
+    Redirect::permanent(&format!("/app{}", uri.path()))
 }
 
 /// Plain-text fallback when FLICK_WEB_DIST has no built web client.
@@ -232,7 +243,29 @@ pub fn app(state: AppState) -> Router {
     let router = Router::new().nest("/api", api_router());
 
     let index = state.config.web_dist.join("index.html");
-    let router = if index.is_file() {
+    let app_index = state.config.web_dist.join("app").join("index.html");
+    let router = if app_index.is_file() {
+        // Combined layout (web 1.1+): the static landing owns the root, the
+        // SPA lives under /app/ with its own SPA fallback, and the old
+        // root-level deep links 301 into /app/ so shared URLs keep working.
+        router
+            .nest_service(
+                "/app",
+                ServeDir::new(state.config.web_dist.join("app"))
+                    .fallback(ServeFile::new(app_index)),
+            )
+            .route("/read/{id}", get(legacy_app_path))
+            .route("/s/{token}", get(legacy_app_path))
+            .route("/r/{code}", get(legacy_app_path))
+            .route("/f/{code}", get(legacy_app_path))
+            .route("/stats", get(legacy_app_path))
+            .route("/auth", get(legacy_app_path))
+            .route("/premium", get(legacy_app_path))
+            .route("/invite", get(legacy_app_path))
+            .route("/wrapped", get(legacy_app_path))
+            .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
+    } else if index.is_file() {
+        // Single-SPA layout (pre-1.1 web build): unchanged behavior.
         router
             .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
     } else {
