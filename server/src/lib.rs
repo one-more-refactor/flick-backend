@@ -143,6 +143,39 @@ async fn legacy_app_path(uri: Uri) -> Redirect {
     Redirect::permanent(&format!("/app{}", uri.path()))
 }
 
+/// The 1.1 era briefly served the SPA under /app/; 1.2 puts it back at the
+/// root. Links minted in that window redirect home with the prefix stripped.
+async fn strip_app_prefix(uri: Uri) -> Redirect {
+    let path = uri.path().strip_prefix("/app").unwrap_or("/");
+    let path = if path.is_empty() { "/" } else { path };
+    Redirect::permanent(path)
+}
+
+/// 308 any request arriving on a retired hostname (FLICK_LEGACY_HOSTS, e.g.
+/// app.myflick.app) to the same path on the canonical public URL. Share links
+/// and bookmarks from the subdomain era keep working forever.
+async fn legacy_host_redirect(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if !st.config.legacy_hosts.is_empty() {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase());
+        if let Some(host) = host {
+            if st.config.legacy_hosts.contains(&host) {
+                let pq = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/");
+                return Redirect::permanent(&format!("{}{}", st.config.public_url, pq))
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
 /// Plain-text fallback when FLICK_WEB_DIST has no built web client.
 async fn no_web_dist(uri: Uri) -> Response {
     let status = if uri.path() == "/" {
@@ -265,8 +298,12 @@ pub fn app(state: AppState) -> Router {
             .route("/wrapped", get(legacy_app_path))
             .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
     } else if index.is_file() {
-        // Single-SPA layout (pre-1.1 web build): unchanged behavior.
+        // Single-SPA layout (the 1.2+ and pre-1.1 shape): SPA at the root;
+        // /app/* links from the brief 1.1 split era strip back home.
         router
+            .route("/app", get(strip_app_prefix))
+            .route("/app/", get(strip_app_prefix))
+            .route("/app/{*rest}", get(strip_app_prefix))
             .fallback_service(ServeDir::new(&state.config.web_dist).fallback(ServeFile::new(index)))
     } else {
         router.fallback(no_web_dist)
@@ -298,6 +335,10 @@ pub fn app(state: AppState) -> Router {
 
     router
         .layer(CompressionLayer::new())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            legacy_host_redirect,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::rate_limit,
