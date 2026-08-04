@@ -41,6 +41,9 @@ pub struct Config {
     pub addr: String,
     pub data_dir: PathBuf,
     pub public_url: String,
+    /// Hostnames that permanently redirect to `public_url` (e.g. the retired
+    /// app. subdomain). From FLICK_LEGACY_HOSTS, comma-separated.
+    pub legacy_hosts: Vec<String>,
     pub web_dist: PathBuf,
     pub oidc: Option<OidcSettings>,
     pub oidc_name: String,
@@ -130,6 +133,14 @@ impl Config {
                 .unwrap_or_else(|| "http://localhost:8484".into())
                 .trim_end_matches('/')
                 .to_string(),
+            legacy_hosts: env_var("FLICK_LEGACY_HOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             web_dist: env_var("FLICK_WEB_DIST")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_web_dist),

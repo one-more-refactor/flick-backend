@@ -29,7 +29,9 @@ Network=flick.network
 PublishPort=127.0.0.1:3011:8484
 Volume=flick-data:/data
 Environment=FLICK_EDITION=hosted
-Environment=FLICK_PUBLIC_URL=https://app.myflick.app
+Environment=FLICK_PUBLIC_URL=https://myflick.app
+# The retired app. subdomain 308s to the canonical host forever.
+Environment=FLICK_LEGACY_HOSTS=app.myflick.app
 Environment=FLICK_ADDR=0.0.0.0:8484
 Environment=FLICK_DATA_DIR=/data
 # Set a real admin token on the host; keep it out of git.
