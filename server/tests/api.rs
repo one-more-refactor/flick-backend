@@ -1873,6 +1873,221 @@ async fn trash_restore_purge_and_tags() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn auth_input_validation_and_security_hardening() {
+    let (app, _dir) = test_app();
+
+    // 1. /api/auth/register validation
+    // Too short email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "a@",
+                "password": "hunter22hunter22",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Email without @
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "invalidemailaddress",
+                "password": "hunter22hunter22",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Too long email (> 254 chars)
+    let too_long_email = format!("{}@example.com", "a".repeat(250));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": too_long_email,
+                "password": "hunter22hunter22",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Too long password (> 128 chars)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "test@example.com",
+                "password": "p".repeat(129),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Too long name (> 100 chars)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "test@example.com",
+                "password": "hunter22hunter22",
+                "name": "n".repeat(101),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. /api/auth/login validation
+    // Too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": "test@example.com",
+                "password": "p".repeat(129),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. /api/auth/lookup, /api/auth/code/request, /api/auth/code/verify email validations
+    for path in ["/api/auth/lookup", "/api/auth/code/request"] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                path,
+                None,
+                json!({
+                    "email": "a@",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                path,
+                None,
+                json!({
+                    "email": format!("{}@example.com", "a".repeat(250)),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({
+                "email": "a@",
+                "code": "123456",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. /api/auth/me PATCH name validation
+    // Register a valid user
+    let cookie = register(&app, "valid_user_validation@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({
+                "name": "n".repeat(101),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. /api/admin/login validation
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": "a@",
+                "password": "hunter22hunter22",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": "admin@example.com",
+                "password": "p".repeat(129),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // -------------------------------------------------------- v0.3: catalog
 
 #[tokio::test]
