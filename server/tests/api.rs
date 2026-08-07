@@ -1873,6 +1873,147 @@ async fn trash_restore_purge_and_tags() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn auth_validation_constraints() {
+    let (app, _dir) = test_app();
+
+    // 1. register with invalid/long emails, passwords, names
+    let long_email = format!("{}@example.com", "a".repeat(250)); // total length 262 > 254
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_password, "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. register with no name but an extremely long email (local part > 100) -> check automatic name truncation
+    let long_local_email = format!("{}@example.com", "a".repeat(110)); // length: 110 + 12 = 122 <= 254
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_local_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cookie = session_cookie(&resp);
+    let user = body_json(resp).await;
+    assert_eq!(user["name"].as_str().unwrap().len(), 100);
+
+    // 2b. register with no name and Greek characters in email -> check safe UTF-8 truncation
+    let alpha_local = "α".repeat(110); // 110 chars, 220 bytes
+    let alpha_email = format!("{}@example.com", alpha_local); // 232 bytes <= 254
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": alpha_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let user_alpha = body_json(resp).await;
+    let name_alpha = user_alpha["name"].as_str().unwrap();
+    assert_eq!(name_alpha.chars().count(), 100);
+
+    // 3. login with over-limit email or password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. update_me with over-limit name
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. lookup, code_request, code_verify with over-limit/invalid email
+    for uri in ["/api/auth/lookup", "/api/auth/code/request"] {
+        let resp = send(
+            &app,
+            json_request("POST", uri, None, json!({"email": "a".repeat(255)})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "a".repeat(255), "code": "123456"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 6. admin login with over-limit email or password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "valid@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // -------------------------------------------------------- v0.3: catalog
 
 #[tokio::test]

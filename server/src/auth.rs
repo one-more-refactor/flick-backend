@@ -308,6 +308,9 @@ pub async fn lookup(
     AppJson(body): AppJson<LookupBody>,
 ) -> Result<Json<Value>, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
+        return Err(AppError::bad_request("invalid email address"));
+    }
     let methods = state
         .db
         .call(move |c| {
@@ -356,6 +359,9 @@ pub async fn code_request(
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
+        return Err(AppError::bad_request("invalid email address"));
+    }
     let lookup = email.clone();
     let exists = state
         .db
@@ -390,6 +396,9 @@ pub async fn code_verify(
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
+        return Err(AppError::bad_request("invalid email address"));
+    }
     let presented_hash = sha256_hex(body.code.trim());
     let now = now_secs();
     let user = state
@@ -437,7 +446,7 @@ pub async fn register(
     AppJson(body): AppJson<RegisterBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
-    if email.len() < 3 || !email.contains('@') {
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
         return Err(AppError::bad_request("invalid email address"));
     }
     if body.password.len() < 8 {
@@ -445,13 +454,26 @@ pub async fn register(
             "password must be at least 8 characters",
         ));
     }
+    if body.password.len() > 128 {
+        return Err(AppError::bad_request(
+            "password must be at most 128 characters",
+        ));
+    }
+    if let Some(ref name) = body.name {
+        if name.trim().len() > 100 {
+            return Err(AppError::bad_request("name must be at most 100 characters"));
+        }
+    }
     // Contract: name is optional — default to the email's local part.
-    let name = body
+    let mut name = body
         .name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
         .or_else(|| email.split('@').next().map(str::to_string))
         .unwrap_or_else(|| "reader".into());
+    if let Some((idx, _)) = name.char_indices().nth(100) {
+        name.truncate(idx);
+    }
 
     let body_ref = body.ref_code.clone();
     let password = body.password;
@@ -505,6 +527,12 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') || body.password.len() > 128 {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
@@ -660,6 +688,9 @@ pub async fn update_me(
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(AppError::bad_request("name must not be empty"));
+        }
+        if name.len() > 100 {
+            return Err(AppError::bad_request("name must be at most 100 characters"));
         }
         user.name = name;
     }
