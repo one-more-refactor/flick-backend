@@ -9,10 +9,12 @@ pub mod books;
 pub mod catalog;
 pub mod config;
 pub mod db;
+pub mod discovery;
 pub mod error;
 pub mod import;
 pub mod integrations;
 pub mod mail;
+pub mod mcp;
 pub mod oidc;
 pub mod ratelimit;
 pub mod referral;
@@ -273,7 +275,13 @@ fn api_router() -> Router<AppState> {
 /// Build the full application router (API + static web client with SPA
 /// fallback, or a plain-text notice when the dist dir is missing).
 pub fn app(state: AppState) -> Router {
-    let router = Router::new().nest("/api", api_router());
+    // The agent surface is merged before the static fallback so that
+    // `/.well-known/*`, `/openapi.json` and `/auth.md` answer with real
+    // documents and real 404s instead of the SPA shell.
+    let router = Router::new()
+        .nest("/api", api_router())
+        .merge(mcp::routes())
+        .merge(discovery::routes());
 
     let index = state.config.web_dist.join("index.html");
     let app_index = state.config.web_dist.join("app").join("index.html");
@@ -334,6 +342,12 @@ pub fn app(state: AppState) -> Router {
     };
 
     router
+        // Innermost, so the markdown it substitutes for HTML is compressed and
+        // gets the same cache and security headers as everything else.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            discovery::markdown_negotiation,
+        ))
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -342,6 +356,10 @@ pub fn app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            discovery::link_headers,
         ))
         .layer(middleware::from_fn(cache_control))
         .layer(middleware::from_fn(security_headers))

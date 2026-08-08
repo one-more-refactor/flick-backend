@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use argon2::password_hash::rand_core::OsRng as SaltRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -252,6 +252,24 @@ impl FromRequestParts<AppState> for AuthUser {
             .await?
             .ok_or(AppError::Unauthorized)?;
         Ok(AuthUser(user))
+    }
+}
+
+/// `Option<AuthUser>` for endpoints that serve signed-out callers too — the
+/// MCP endpoint, whose public tools need no session at all. A missing or
+/// expired cookie is `None`; a database failure is still an error.
+impl OptionalFromRequestParts<AppState> for AuthUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        match <AuthUser as FromRequestParts<AppState>>::from_request_parts(parts, state).await {
+            Ok(user) => Ok(Some(user)),
+            Err(AppError::Unauthorized) => Ok(None),
+            Err(other) => Err(other),
+        }
     }
 }
 

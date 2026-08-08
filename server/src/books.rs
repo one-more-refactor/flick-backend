@@ -159,7 +159,7 @@ pub struct ListQuery {
 /// in), ANDed together. `None` when nothing searchable remains — the caller
 /// then returns an empty list rather than a 500 (CONTRACTS.md: FTS syntax
 /// errors must not surface as 500s).
-fn fts_query(q: &str) -> Option<String> {
+pub(crate) fn fts_query(q: &str) -> Option<String> {
     let terms: Vec<String> = q
         .split_whitespace()
         .map(|t| {
@@ -206,15 +206,15 @@ fn multipart_err(e: MultipartError) -> AppError {
     AppError::Status(e.status(), e.body_text())
 }
 
-/// Tokenize a `Prepared` book through flick-core (off the async runtime),
-/// persist it (with its plaintext, for `/text` + search), and return `201`.
-/// Shared by paste, uploads and both web-import paths. `title_fallback` fills
-/// in a title when the parser found none (e.g. paste/pdf → first ~40 chars).
-async fn insert_prepared(
+/// Tokenize a `Prepared` book through flick-core (off the async runtime) and
+/// persist it (with its plaintext, for `/text` + search). Shared by paste,
+/// uploads, both web-import paths and the MCP tools; the HTTP handlers wrap
+/// the returned book in a `201`.
+pub(crate) async fn insert_prepared(
     state: &AppState,
     user: &crate::db::User,
     prepared: Prepared,
-) -> Result<Response, AppError> {
+) -> Result<Book, AppError> {
     let Prepared {
         title,
         text,
@@ -291,6 +291,16 @@ async fn insert_prepared(
             "upload_limit",
         ));
     }
+    Ok(book)
+}
+
+/// `insert_prepared` as the `201 {book}` every create endpoint answers with.
+async fn created(
+    state: &AppState,
+    user: &crate::db::User,
+    prepared: Prepared,
+) -> Result<Response, AppError> {
+    let book = insert_prepared(state, user, prepared).await?;
     Ok((StatusCode::CREATED, Json(book)).into_response())
 }
 
@@ -327,7 +337,7 @@ pub async fn create(
         }
     };
 
-    insert_prepared(&state, &user, prepared).await
+    created(&state, &user, prepared).await
 }
 
 /// Pull `title` + `file` out of the multipart body and route by content sniff.
@@ -454,18 +464,18 @@ pub struct ImportUrlBody {
     title: Option<String>,
 }
 
-/// POST /api/import/url — server fetches the page (SSRF-guarded) and imports
-/// it: pdf/epub/plain bytes go through the upload parsers, HTML through
-/// readability (CONTRACTS.md).
-pub async fn import_url(
-    State(state): State<AppState>,
-    AuthUser(user): AuthUser,
-    AppJson(body): AppJson<ImportUrlBody>,
-) -> Result<Response, AppError> {
-    let title = clean_title(body.title);
-    let (final_url, bytes, content_type) = import::guarded_fetch(body.url.trim()).await?;
+/// Fetch a URL under the SSRF guard and turn whatever comes back into a
+/// `Prepared` book: pdf/epub/plain bytes go through the upload parsers, HTML
+/// through readability (CONTRACTS.md). Shared by the HTTP handler and the MCP
+/// tool so both inherit the same guard and the same extraction.
+pub(crate) async fn prepare_url_import(
+    url: &str,
+    title: Option<String>,
+) -> Result<Prepared, AppError> {
+    let title = clean_title(title);
+    let (final_url, bytes, content_type) = import::guarded_fetch(url.trim()).await?;
 
-    let prepared = if import::looks_like_pdf(&bytes)
+    if import::looks_like_pdf(&bytes)
         || import::looks_like_epub(&bytes)
         || !import::looks_like_html(&content_type, &bytes)
     {
@@ -476,17 +486,26 @@ pub async fn import_url(
         prepared.source = "url";
         prepared.url = Some(final_url.clone());
         prepared.favicon = import::origin_favicon(&final_url);
-        prepared
+        Ok(prepared)
     } else {
         let html = String::from_utf8_lossy(&bytes).into_owned();
         let mut prepared = import::extract_article(html, final_url, "url").await?;
         if title.is_some() {
             prepared.title = title;
         }
-        prepared
-    };
+        Ok(prepared)
+    }
+}
 
-    insert_prepared(&state, &user, prepared).await
+/// POST /api/import/url — server fetches the page (SSRF-guarded) and imports
+/// it (CONTRACTS.md).
+pub async fn import_url(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    AppJson(body): AppJson<ImportUrlBody>,
+) -> Result<Response, AppError> {
+    let prepared = prepare_url_import(&body.url, body.title).await?;
+    created(&state, &user, prepared).await
 }
 
 #[derive(Deserialize)]
@@ -516,7 +535,7 @@ pub async fn import_html(
     if title.is_some() {
         prepared.title = title;
     }
-    insert_prepared(&state, &user, prepared).await
+    created(&state, &user, prepared).await
 }
 
 pub async fn get_book(
