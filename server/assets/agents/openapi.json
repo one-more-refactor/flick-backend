@@ -1,0 +1,750 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "flick HTTP API",
+    "summary": "Speed-reading (RSVP) library, reading engine and stats.",
+    "description": "The API every flick client speaks. It is specified in docs/CONTRACTS.md, which is the binding document: when this file and CONTRACTS.md disagree, CONTRACTS.md wins.\n\nAuthentication is a first-party session cookie. Any agent can mint one with no registration via `POST /api/auth/guest` — see /auth.md.\n\nThe same API ships in the self-hosted server, so a client written against this document works against myflick.app and against a container on someone's laptop.",
+    "version": "{{VERSION}}",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
+    },
+    "contact": {
+      "name": "flick",
+      "url": "https://github.com/one-more-refactor/flick"
+    }
+  },
+  "servers": [
+    {
+      "url": "{{BASE}}/api",
+      "description": "This flick server"
+    }
+  ],
+  "externalDocs": {
+    "description": "CONTRACTS.md — the binding specification",
+    "url": "https://github.com/one-more-refactor/flick/blob/master/docs/CONTRACTS.md"
+  },
+  "tags": [
+    { "name": "meta", "description": "Server identity and edition." },
+    { "name": "auth", "description": "Sessions, accounts and providers." },
+    { "name": "catalog", "description": "Public-domain works shipped with the server. No account needed to browse." },
+    { "name": "books", "description": "The caller's library: import, search, read, track position." },
+    { "name": "stats", "description": "Reading days, streak and session log." }
+  ],
+  "paths": {
+    "/meta": {
+      "get": {
+        "tags": ["meta"],
+        "operationId": "getMeta",
+        "summary": "Server edition, version and announcement",
+        "description": "Public. Also serves as this API's status endpoint — a 200 means the server and its database are up.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["edition", "version"],
+                  "properties": {
+                    "edition": {
+                      "type": "string",
+                      "enum": ["selfhost", "hosted"],
+                      "description": "`selfhost` has no limits; `hosted` applies the free/Pro plans."
+                    },
+                    "version": { "type": "string", "examples": ["1.3.0"] },
+                    "announcement": {
+                      "type": ["string", "null"],
+                      "description": "Operator banner text, or null."
+                    },
+                    "admin_url": { "type": ["string", "null"], "format": "uri" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/guest": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "createGuestSession",
+        "summary": "Mint an anonymous session",
+        "description": "The agent entry point. No registration, no credentials, no email. Returns a real user row (`guest: true`) seeded with the full starter library, and sets the `flick_session` cookie. If the guest later registers or logs in while still holding this cookie, the guest's books and stats merge into that account.",
+        "security": [],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ref": { "type": "string", "description": "Referral code, if the visitor arrived through one." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Guest created; session cookie set",
+            "headers": {
+              "Set-Cookie": {
+                "description": "`flick_session=<token>; HttpOnly; SameSite=Lax; Secure` (Secure behind TLS).",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/User" } }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/auth/lookup": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "lookupEmail",
+        "summary": "Which sign-in methods an email has",
+        "description": "Drives the email-first auth screen: one email field decides between registration, password, email code and linked SSO providers.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": { "email": { "type": "string", "format": "email" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Available methods",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["exists", "methods"],
+                  "properties": {
+                    "exists": { "type": "boolean" },
+                    "methods": {
+                      "type": "array",
+                      "items": { "type": "string", "examples": ["password", "code", "google", "github", "oidc"] }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "register",
+        "summary": "Create an account",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "password": { "type": "string", "format": "password" },
+                  "name": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account created; session cookie set",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "login",
+        "summary": "Sign in with a password",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "password": { "type": "string", "format": "password" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; session cookie set",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "logout",
+        "summary": "End the session and clear the cookie",
+        "responses": { "204": { "description": "Signed out" } }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": ["auth"],
+        "operationId": "getMe",
+        "summary": "The signed-in user",
+        "responses": {
+          "200": { "description": "The caller", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "patch": {
+        "tags": ["auth"],
+        "operationId": "updateMe",
+        "summary": "Update profile and reading settings",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "username": { "type": "string", "minLength": 2, "maxLength": 24, "pattern": "^[a-zA-Z0-9_-]+$" },
+                  "name": { "type": "string" },
+                  "onboarded": { "type": "boolean" },
+                  "avatar": { "type": "string", "description": "Square PNG/JPEG/WebP `data:` URL under ~150 KB, or \"\" to clear." },
+                  "settings": { "$ref": "#/components/schemas/Settings" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "delete": {
+        "tags": ["auth"],
+        "operationId": "deleteMe",
+        "summary": "Erase the account and everything it owns",
+        "description": "GDPR Art. 17. Irreversible; the session cookie is cleared.",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/auth/export": {
+      "get": {
+        "tags": ["auth"],
+        "operationId": "exportMe",
+        "summary": "Download everything the server holds about the caller",
+        "description": "GDPR Art. 15/20. Profile, library including source text, reading days, sessions and the caller's own friend list, as a JSON attachment.",
+        "responses": {
+          "200": { "description": "JSON attachment", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/auth/providers": {
+      "get": {
+        "tags": ["auth"],
+        "operationId": "listProviders",
+        "summary": "Configured SSO providers",
+        "description": "Only providers this server actually has credentials for. An empty list means password and email-code sign-in only.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Providers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "providers": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "string", "enum": ["google", "github", "oidc"] },
+                          "name": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/catalog": {
+      "get": {
+        "tags": ["catalog"],
+        "operationId": "listCatalog",
+        "summary": "Public-domain works shipped with the server",
+        "description": "Public, no account. Every new user — guests included — is seeded with all of these.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Catalog entries",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/CatalogEntry" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/catalog/{slug}/add": {
+      "post": {
+        "tags": ["catalog"],
+        "operationId": "addCatalogBook",
+        "summary": "Copy a catalog work into the caller's library",
+        "parameters": [
+          { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "201": { "description": "Added", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Book" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": {
+            "description": "Already in the library. The error body carries the existing id; clients treat this as success and open that copy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "error": { "type": "string" }, "book_id": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/books": {
+      "get": {
+        "tags": ["books"],
+        "operationId": "listBooks",
+        "summary": "The caller's library, optionally full-text searched",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "SQLite FTS5 search across title and stored text. Omitted returns the whole library.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Books", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Book" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["books"],
+        "operationId": "createBook",
+        "summary": "Add a book from pasted text or an uploaded file",
+        "description": "JSON adds pasted text. Multipart uploads a file — the extension is only a hint, the bytes decide: `%PDF` → PDF, zip with an EPUB mimetype → EPUB, UTF-8 text containing `==========` separators → Kindle \"My Clippings\", other UTF-8 text → txt/Markdown. Anything else is a 400. Limit 25 MB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                  "text": { "type": "string" },
+                  "title": { "type": "string", "description": "Defaults to the first ~40 characters of the text." }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": { "type": "string", "format": "binary" },
+                  "title": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Book" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": { "description": "Over the 25 MB upload limit" }
+        }
+      }
+    },
+    "/books/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+      "get": {
+        "tags": ["books"],
+        "operationId": "getBook",
+        "summary": "One book",
+        "responses": {
+          "200": { "description": "The book", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Book" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["books"],
+        "operationId": "deleteBook",
+        "summary": "Move a book to trash",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/books/{id}/timeline": {
+      "get": {
+        "tags": ["books"],
+        "operationId": "getTimeline",
+        "summary": "The paced reading timeline",
+        "description": "The whole point of flick. Clients render each entry for `weight * (60000 / wpm)` milliseconds and never reimplement the pacing — it lives only in flick-core.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Timeline", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Timeline" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/books/{id}/text": {
+      "get": {
+        "tags": ["books"],
+        "operationId": "getBookText",
+        "summary": "The book as paragraphs of words",
+        "description": "Words flattened across paragraphs match timeline indices exactly (same tokenizer), so a client can map text to timeline 1:1. This is the endpoint to use when you want to *read* the content rather than play it.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Paragraphs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "paragraphs": {
+                      "type": "array",
+                      "items": { "type": "array", "items": { "type": "string" } }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/books/{id}/position": {
+      "put": {
+        "tags": ["books"],
+        "operationId": "setPosition",
+        "summary": "Save reading position and report words read",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["position"],
+                "properties": {
+                  "position": { "type": "integer", "minimum": 0, "description": "Timeline index." },
+                  "read": { "type": "integer", "description": "Words consumed since the last report. Clamped to 0–500 per report." },
+                  "day": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "The client's LOCAL date — streaks are a human-day concept. Rejected if more than 2 days from server date." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Saved" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/import/url": {
+      "post": {
+        "tags": ["books"],
+        "operationId": "importUrl",
+        "summary": "Import a web page or hosted file",
+        "description": "The server fetches the URL (20 s timeout, 25 MB cap, at most 5 redirects) and either extracts the raw file (PDF/EPUB/txt by content sniff) or the readable article text. SSRF-guarded: http(s) only, and every resolved IP — re-checked on each redirect hop — must be public unicast.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "format": "uri" },
+                  "title": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Imported", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Book" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "tags": ["stats"],
+        "operationId": "getStats",
+        "summary": "Reading days, totals and streak",
+        "responses": {
+          "200": {
+            "description": "Stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "today": {
+                      "type": "object",
+                      "properties": { "day": { "type": "string" }, "words": { "type": "integer" } }
+                    },
+                    "total_words": { "type": "integer" },
+                    "goal": { "type": "integer", "description": "Words per day that make a streak day. Server constant, 300." },
+                    "streak": {
+                      "type": "object",
+                      "properties": { "current": { "type": "integer" }, "best": { "type": "integer" } }
+                    },
+                    "days": {
+                      "type": "array",
+                      "description": "Last 42 entries.",
+                      "items": {
+                        "type": "object",
+                        "properties": { "day": { "type": "string" }, "words": { "type": "integer" } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "tags": ["stats"],
+        "operationId": "listSessions",
+        "summary": "Recent reading sessions, newest first",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } }
+        ],
+        "responses": {
+          "200": { "description": "Sessions", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Session" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["stats"],
+        "operationId": "createSession",
+        "summary": "Log a finished reading session",
+        "description": "Posted on reader exit or pause-end, and only when the session ran at least 10 s and 20 words. The server sanity-clamps duration (≤ 6 h), avg_wpm (≤ 1500) and checks words against duration × wpm within ±50%.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["book_id", "started_at", "duration_ms", "words", "avg_wpm"],
+                "properties": {
+                  "book_id": { "type": "string" },
+                  "started_at": { "type": "integer", "description": "Unix seconds." },
+                  "duration_ms": { "type": "integer" },
+                  "words": { "type": "integer" },
+                  "avg_wpm": { "type": "number" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Logged" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "flick_session",
+        "description": "HttpOnly session cookie, `SameSite=Lax`, `Secure` behind TLS. Obtain one with `POST /api/auth/guest` (no registration), or by signing in. See /auth.md."
+      }
+    },
+    "schemas": {
+      "Settings": {
+        "type": "object",
+        "properties": {
+          "wpm": { "type": "integer", "minimum": 100, "maximum": 1200, "default": 350 },
+          "theme": { "type": "string", "enum": ["auto", "light", "dark"], "default": "auto" },
+          "accent": { "type": "string", "enum": ["red", "ember", "acid", "cyan", "violet", "mono"], "default": "red" },
+          "lang": { "type": "string", "enum": ["auto", "en", "de", "es"], "default": "auto" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "required": ["id", "name", "guest"],
+        "properties": {
+          "id": { "type": "string" },
+          "email": { "type": ["string", "null"], "format": "email" },
+          "name": { "type": "string" },
+          "username": { "type": ["string", "null"] },
+          "guest": { "type": "boolean" },
+          "onboarded": { "type": "boolean" },
+          "settings": { "$ref": "#/components/schemas/Settings" }
+        }
+      },
+      "CatalogEntry": {
+        "type": "object",
+        "properties": {
+          "slug": { "type": "string" },
+          "title": { "type": "string" },
+          "author": { "type": "string" },
+          "lang": { "type": "string" },
+          "kind": { "type": "string" },
+          "description": { "type": "string" },
+          "word_count": { "type": "integer" }
+        }
+      },
+      "Book": {
+        "type": "object",
+        "required": ["id", "title", "source", "word_count", "position", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "source": {
+            "type": "string",
+            "enum": ["paste", "pdf", "epub", "txt", "clippings", "url", "html", "catalog", "intro"]
+          },
+          "word_count": { "type": "integer" },
+          "position": { "type": "integer", "description": "Timeline index the caller last reached." },
+          "created_at": { "type": "integer", "description": "Unix seconds." },
+          "last_read_at": { "type": ["integer", "null"] },
+          "author": { "type": ["string", "null"] },
+          "url": { "type": ["string", "null"], "format": "uri" },
+          "favicon": { "type": ["string", "null"], "format": "uri" },
+          "excerpt": { "type": ["string", "null"] },
+          "category": {
+            "type": ["string", "null"],
+            "enum": ["article", "news", "docs", "book", "story", "essay", null]
+          }
+        }
+      },
+      "Timeline": {
+        "type": "object",
+        "required": ["version", "words", "word_count"],
+        "properties": {
+          "version": { "type": "integer" },
+          "word_count": { "type": "integer" },
+          "words": {
+            "type": "array",
+            "description": "Each entry is `[text, orp_index, weight]`: the token to show, the 0-based index of its pivot letter, and its relative duration.",
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                { "type": "string" },
+                { "type": "integer" },
+                { "type": "number" }
+              ],
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "book_id": { "type": "string" },
+          "book_title": { "type": "string" },
+          "started_at": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "words": { "type": "integer" },
+          "avg_wpm": { "type": "number" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": { "error": { "type": "string", "description": "Human-readable message." } }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "No valid session. Call `POST /api/auth/guest` to get one.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "No such resource, or it belongs to someone else — the two are deliberately indistinguishable.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "RateLimited": {
+        "description": "Per-client fixed-window limit hit. `Retry-After` says when to come back.",
+        "headers": { "Retry-After": { "schema": { "type": "integer" } } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  },
+  "security": [{ "sessionCookie": [] }]
+}

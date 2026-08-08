@@ -3008,3 +3008,438 @@ async fn admin_hidden_when_unconfigured() {
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ------------------------------------------------------- agent discovery
+
+/// A test app whose web dist actually exists, so the SPA fallback serves HTML
+/// and the discovery routes have to win against it.
+fn test_app_with_dist() -> (Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dist = dir.path().join("dist");
+    std::fs::create_dir_all(&dist).expect("dist");
+    std::fs::write(
+        dist.join("index.html"),
+        "<!doctype html><title>flick</title>",
+    )
+    .expect("index.html");
+    let dist_for_config = dist.clone();
+    let (app, _dir2) = test_app_with_config(move |c| {
+        c.web_dist = dist_for_config;
+        c.public_url = "https://flick.test".into();
+    });
+    // Keep the dist dir alive for the life of the app.
+    std::mem::forget(_dir2);
+    (app, dir)
+}
+
+fn content_type(resp: &Response) -> String {
+    resp.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn body_text(resp: Response) -> String {
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+}
+
+#[tokio::test]
+async fn discovery_documents_are_typed_not_the_spa_shell() {
+    let (app, _dir) = test_app_with_dist();
+
+    // The whole point: with a real dist in place, these must NOT be HTML.
+    for (path, expected) in [
+        ("/.well-known/api-catalog", "application/linkset+json"),
+        ("/.well-known/mcp/server-card.json", "application/json"),
+        ("/.well-known/agent-skills/index.json", "application/json"),
+        ("/openapi.json", "application/json"),
+    ] {
+        let resp = send(&app, bare_request("GET", path, None)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(content_type(&resp), expected, "{path}");
+    }
+
+    for path in ["/auth.md", "/docs/api"] {
+        let resp = send(&app, bare_request("GET", path, None)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            content_type(&resp),
+            "text/markdown; charset=utf-8",
+            "{path}"
+        );
+        assert!(resp.headers().contains_key("x-markdown-tokens"), "{path}");
+    }
+
+    // And an unpublished well-known path is an honest JSON 404, not 200 HTML.
+    let resp = send(
+        &app,
+        bare_request("GET", "/.well-known/oauth-authorization-server", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(content_type(&resp), "application/json");
+}
+
+#[tokio::test]
+async fn discovery_documents_carry_this_servers_own_base_url() {
+    let (app, _dir) = test_app_with_dist();
+
+    let resp = send(&app, bare_request("GET", "/.well-known/api-catalog", None)).await;
+    let catalog = body_json(resp).await;
+    let entry = &catalog["linkset"][0];
+    assert_eq!(entry["anchor"], "https://flick.test/api");
+    assert_eq!(
+        entry["service-desc"][0]["href"],
+        "https://flick.test/openapi.json"
+    );
+    // The flat view several crawlers expect describes the same links.
+    let flat: Vec<&str> = entry["links"]
+        .as_array()
+        .expect("links array")
+        .iter()
+        .map(|l| l["rel"].as_str().unwrap_or_default())
+        .collect();
+    assert!(flat.contains(&"service-desc") && flat.contains(&"service-doc"));
+
+    let resp = send(&app, bare_request("GET", "/auth.md", None)).await;
+    let auth = body_text(resp).await;
+    assert!(!auth.contains("{{BASE}}"), "placeholder left unrendered");
+    assert!(auth.contains("https://flick.test/api/auth/guest"));
+    // The agent_auth block the auth.md spec asks for.
+    assert!(auth.contains("agent_auth:") && auth.contains("register_uri:"));
+}
+
+#[tokio::test]
+async fn agent_skill_digests_match_the_bytes_served() {
+    use sha2::{Digest, Sha256};
+
+    let (app, _dir) = test_app_with_dist();
+    let resp = send(
+        &app,
+        bare_request("GET", "/.well-known/agent-skills/index.json", None),
+    )
+    .await;
+    let index = body_json(resp).await;
+    assert_eq!(
+        index["$schema"],
+        "https://schemas.agentskills.io/discovery/0.2.0/schema.json"
+    );
+
+    let skills = index["skills"].as_array().expect("skills array");
+    assert!(!skills.is_empty());
+    for skill in skills {
+        let url = skill["url"].as_str().expect("url");
+        let path = url.strip_prefix("https://flick.test").expect("same origin");
+        let resp = send(&app, bare_request("GET", path, None)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(content_type(&resp), "text/markdown; charset=utf-8");
+
+        let body = body_text(resp).await;
+        let digest =
+            Sha256::digest(body.as_bytes())
+                .iter()
+                .fold("sha256:".to_string(), |mut acc, b| {
+                    use std::fmt::Write;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                });
+        assert_eq!(skill["digest"], digest, "digest drifted for {path}");
+    }
+
+    // An unknown skill name is a 404, not a 200 with someone else's skill.
+    let resp = send(
+        &app,
+        bare_request("GET", "/.well-known/agent-skills/nope/SKILL.md", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn html_pages_advertise_the_agent_surface_in_link_headers() {
+    let (app, _dir) = test_app_with_dist();
+    let resp = send(&app, bare_request("GET", "/", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(content_type(&resp).starts_with("text/html"));
+
+    let link = resp
+        .headers()
+        .get(header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .expect("Link header on the homepage")
+        .to_string();
+    for rel in ["api-catalog", "service-desc", "service-doc", "license"] {
+        assert!(
+            link.contains(&format!("rel=\"{rel}\"")),
+            "missing rel={rel}"
+        );
+    }
+    assert!(link.contains("<https://flick.test/openapi.json>"));
+
+    // JSON responses stay clean.
+    let resp = send(&app, bare_request("GET", "/api/meta", None)).await;
+    assert!(resp.headers().get(header::LINK).is_none());
+}
+
+#[tokio::test]
+async fn markdown_is_served_only_when_explicitly_asked_for() {
+    let (app, _dir) = test_app_with_dist();
+
+    // A browser's Accept keeps getting the app.
+    let browser = Request::builder()
+        .uri("/")
+        .header(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, browser).await;
+    assert!(content_type(&resp).starts_with("text/html"));
+    // …but it is told the URL has more than one representation.
+    assert!(resp.headers().get_all(header::VARY).iter().any(|v| v
+        .to_str()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("accept")));
+
+    // An agent asking for markdown gets markdown, with a token estimate.
+    let agent = Request::builder()
+        .uri("/")
+        .header(header::ACCEPT, "text/markdown")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, agent).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), "text/markdown; charset=utf-8");
+    let tokens: usize = resp
+        .headers()
+        .get("x-markdown-tokens")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("x-markdown-tokens");
+    assert!(tokens > 0);
+    let body = body_text(resp).await;
+    assert!(body.starts_with("# flick"));
+    assert!(!body.contains("{{BASE}}"));
+
+    // A path with no markdown twin still serves the app.
+    let agent = Request::builder()
+        .uri("/library")
+        .header(header::ACCEPT, "text/markdown")
+        .body(Body::empty())
+        .expect("request");
+    let resp = send(&app, agent).await;
+    assert!(content_type(&resp).starts_with("text/html"));
+}
+
+// -------------------------------------------------------------------- MCP
+
+async fn rpc(app: &Router, cookie: Option<&str>, body: Value) -> Value {
+    let resp = send(app, json_request("POST", "/mcp", cookie, body)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn mcp_initializes_and_lists_tools_without_a_session() {
+    let (app, _dir) = test_app_with_dist();
+
+    let out = rpc(
+        &app,
+        None,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    )
+    .await;
+    assert_eq!(out["id"], 1);
+    assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(out["result"]["serverInfo"]["name"], "flick");
+    assert!(out["result"]["capabilities"]["tools"].is_object());
+
+    let out = rpc(
+        &app,
+        None,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    let names: Vec<&str> = out["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default())
+        .collect();
+    for expected in ["preview_timeline", "list_catalog", "search_library"] {
+        assert!(names.contains(&expected), "missing tool {expected}");
+    }
+
+    // The server card points at a transport that actually answers.
+    let resp = send(
+        &app,
+        bare_request("GET", "/.well-known/mcp/server-card.json", None),
+    )
+    .await;
+    let card = body_json(resp).await;
+    assert_eq!(card["transport"]["endpoint"], "https://flick.test/mcp");
+    assert_eq!(card["capabilities"]["tools"], true);
+    assert_eq!(card["protocolVersion"], "2025-06-18");
+}
+
+#[tokio::test]
+async fn mcp_public_tools_need_no_session_and_library_tools_say_so() {
+    let (app, _dir) = test_app_with_dist();
+
+    let out = rpc(
+        &app,
+        None,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "preview_timeline",
+                "arguments": {"text": "One word at a time.", "wpm": 300, "max_words": 2},
+            },
+        }),
+    )
+    .await;
+    let result = &out["result"];
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["word_count"], 5);
+    assert_eq!(
+        result["structuredContent"]["words"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A library tool without a session fails usefully rather than 401-ing.
+    let out = rpc(
+        &app,
+        None,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "search_library", "arguments": {}},
+        }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], true);
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("/api/auth/guest"), "no recovery hint: {text}");
+}
+
+#[tokio::test]
+async fn mcp_library_tools_are_scoped_to_the_session_user() {
+    let (app, _dir) = test_app_with_dist();
+    let cookie = register(&app, "mcp@example.com").await;
+    create_paste_book(
+        &app,
+        &cookie,
+        Some("Fovea notes"),
+        "The fovea resolves letters.",
+    )
+    .await;
+
+    let out = rpc(
+        &app,
+        Some(&cookie),
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "search_library", "arguments": {"query": "fovea"}},
+        }),
+    )
+    .await;
+    let books = out["result"]["structuredContent"]["books"]
+        .as_array()
+        .expect("books");
+    assert_eq!(books.len(), 1);
+    let book_id = books[0]["id"].as_str().expect("id").to_string();
+
+    // The text tool returns readable paragraphs with timeline-aligned counts.
+    let out = rpc(
+        &app,
+        Some(&cookie),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_book_text", "arguments": {"book_id": book_id}},
+        }),
+    )
+    .await;
+    let text = &out["result"]["structuredContent"];
+    assert_eq!(text["word_count"], 4);
+    assert_eq!(text["paragraphs"][0], "The fovea resolves letters.");
+
+    // Another account cannot see it.
+    let other = register(&app, "other@example.com").await;
+    let out = rpc(
+        &app,
+        Some(&other),
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "get_book_text", "arguments": {"book_id": "deadbeef"}},
+        }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn mcp_speaks_json_rpc_properly() {
+    let (app, _dir) = test_app_with_dist();
+
+    // Notifications get an acknowledgement and no body.
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/mcp",
+            None,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Unknown methods are a -32601, not a 404 or a panic.
+    let out = rpc(
+        &app,
+        None,
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/summon"}),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], -32601);
+
+    // Batches answer only the requests, dropping the notifications.
+    let out = rpc(
+        &app,
+        None,
+        json!([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "prompts/list"},
+        ]),
+    )
+    .await;
+    let responses = out.as_array().expect("batch response");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+
+    // Garbage in is a parse error, not a 500.
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{not json"))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"]["code"], -32700);
+
+    // GET has no stream to give.
+    let resp = send(&app, bare_request("GET", "/mcp", None)).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}

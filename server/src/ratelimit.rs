@@ -58,6 +58,10 @@ pub struct RateLimits {
     pub admin_login: Rule,
     pub delete_me: Rule,
     pub export: Rule,
+    /// The MCP endpoint as a whole. Individual tools that cost real work
+    /// (`import_url`) also charge their own bucket, so this is only the
+    /// coarse "one client, one endpoint" ceiling.
+    pub mcp: Rule,
 }
 
 impl Default for RateLimits {
@@ -76,6 +80,7 @@ impl Default for RateLimits {
             // able to erase the account or pull the full export in a loop.
             delete_me: Rule::new(5, FIVE_MIN),
             export: Rule::new(10, HOUR),
+            mcp: Rule::new(300, HOUR),
         }
     }
 }
@@ -97,6 +102,7 @@ impl RateLimits {
             ("POST", "/api/admin/login") => Some(("admin_login", self.admin_login)),
             ("DELETE", "/api/auth/me") => Some(("delete_me", self.delete_me)),
             ("GET", "/api/auth/export") => Some(("export", self.export)),
+            ("POST", "/mcp") => Some(("mcp", self.mcp)),
             _ => None,
         }
     }
@@ -126,6 +132,13 @@ impl RateLimiter {
                 next_sweep: Instant::now() + SWEEP_EVERY,
             }),
         }
+    }
+
+    /// Charge the shared outbound-fetch budget from outside the HTTP route.
+    /// The MCP `import_url` tool spends the same allowance as
+    /// `POST /api/import/url`, so an agent cannot use MCP to sidestep it.
+    pub fn check_import_url(&self, client: &str) -> Result<(), u64> {
+        self.check("import_url", self.limits.import_url, client)
     }
 
     /// Count one request against `(endpoint, client)`. `Ok` = allowed;
