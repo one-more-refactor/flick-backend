@@ -690,6 +690,135 @@ async fn patch_me_validation() {
     assert_eq!(me["settings"]["wpm"], 350);
 }
 
+#[tokio::test]
+async fn auth_input_validation_constraints() {
+    let (app, _dir) = test_app();
+
+    // 1. Register: excessively long email (> 254)
+    let long_email = format!("{}@example.com", "a".repeat(250)); // length 262
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Register: excessively long password (> 128)
+    let long_pw = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_pw, "name": "Ada"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Register: excessively long name (> 100)
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Register: auto-generated name truncation from a long local part
+    let long_local_email = format!("{}@example.com", "x".repeat(110)); // length 122 (< 254)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_local_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let user = body_json(resp).await;
+    let name_str = user["name"].as_str().expect("name string");
+    assert_eq!(name_str.len(), 100);
+    assert_eq!(name_str, "x".repeat(100));
+
+    // 5. Login: excessive email/password length rejected immediately as 401
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "x".repeat(255), "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": "x".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 6. Admin Login: excessive email/password length rejected immediately as 401
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "x".repeat(255), "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": "x".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 7. Update me: name > 100 characters rejected
+    let cookie = register(&app, "updatename@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({ "name": "y".repeat(101) }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // --------------------------------------------------------- v0.3: guests
 
 #[tokio::test]

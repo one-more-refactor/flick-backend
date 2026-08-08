@@ -493,7 +493,11 @@ async fn complete(
     email_verified: bool,
     name: String,
 ) -> Result<Response, AppError> {
-    let candidate = new_user(email.clone(), name, None, false);
+    let mut truncated_name = name;
+    if let Some((idx, _)) = truncated_name.char_indices().nth(100) {
+        truncated_name.truncate(idx);
+    }
+    let candidate = new_user(email.clone(), truncated_name, None, false);
     let now = now_secs();
     let provider_owned = provider.to_string();
     let outcome = state
