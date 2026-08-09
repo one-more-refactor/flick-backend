@@ -455,12 +455,17 @@ pub async fn register(
     AppJson(body): AppJson<RegisterBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
-    if email.len() < 3 || !email.contains('@') {
+    if email.len() < 3 || email.len() > 254 || !email.contains('@') {
         return Err(AppError::bad_request("invalid email address"));
     }
     if body.password.len() < 8 {
         return Err(AppError::bad_request(
             "password must be at least 8 characters",
+        ));
+    }
+    if body.password.len() > 128 {
+        return Err(AppError::bad_request(
+            "password must be at most 128 characters",
         ));
     }
     // Contract: name is optional — default to the email's local part.
@@ -470,6 +475,10 @@ pub async fn register(
         .filter(|n| !n.is_empty())
         .or_else(|| email.split('@').next().map(str::to_string))
         .unwrap_or_else(|| "reader".into());
+
+    if name.chars().count() > 100 {
+        return Err(AppError::bad_request("name must be at most 100 characters"));
+    }
 
     let body_ref = body.ref_code.clone();
     let password = body.password;
@@ -522,6 +531,11 @@ pub async fn login(
     headers: HeaderMap,
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
+    if body.password.len() > 128 {
+        return Err(AppError::bad_request(
+            "password must be at most 128 characters",
+        ));
+    }
     let email = body.email.trim().to_lowercase();
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
@@ -678,6 +692,9 @@ pub async fn update_me(
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(AppError::bad_request("name must not be empty"));
+        }
+        if name.chars().count() > 100 {
+            return Err(AppError::bad_request("name must be at most 100 characters"));
         }
         user.name = name;
     }
