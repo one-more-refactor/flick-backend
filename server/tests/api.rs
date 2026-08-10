@@ -3443,3 +3443,138 @@ async fn mcp_speaks_json_rpc_properly() {
     let resp = send(&app, bare_request("GET", "/mcp", None)).await;
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn test_auth_input_limits() {
+    let (app, _dir) = test_app();
+
+    // 1. Email too long (255 chars)
+    let long_email = format!("{}@example.com", "a".repeat(243)); // 243 + 12 = 255 chars
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": long_email,
+                "password": "validpassword",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Password too long (129 chars)
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "valid@example.com",
+                "password": long_password,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Name too long (101 chars)
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "valid2@example.com",
+                "password": "validpassword",
+                "name": long_name,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Login with too long password/email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": "valid@example.com",
+                "password": "p".repeat(129),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. Update name with 101 chars
+    let cookie = register(&app, "updatename@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({
+                "name": "n".repeat(101),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 6. Lookup with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(243)),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 7. Code request with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(243)),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 8. Code verify with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(243)),
+                "code": "123456",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
