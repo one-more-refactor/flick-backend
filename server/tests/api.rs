@@ -288,7 +288,10 @@ async fn auth_input_validation() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(resp).await["error"], "password must be at least 8 characters");
+    assert_eq!(
+        body_json(resp).await["error"],
+        "password must be at least 8 characters"
+    );
 
     // Over 128 characters
     let long_password = "p".repeat(129);
@@ -303,7 +306,10 @@ async fn auth_input_validation() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(resp).await["error"], "password must be at most 128 characters");
+    assert_eq!(
+        body_json(resp).await["error"],
+        "password must be at most 128 characters"
+    );
 
     // 2. Email length / format limits
     // Too long email
@@ -334,7 +340,10 @@ async fn auth_input_validation() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(resp).await["error"], "display name must be at most 100 characters");
+    assert_eq!(
+        body_json(resp).await["error"],
+        "display name must be at most 100 characters"
+    );
 
     // 4. Password limit during login
     let resp = send(
