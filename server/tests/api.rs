@@ -272,6 +272,86 @@ async fn duplicate_register_conflicts() {
 }
 
 #[tokio::test]
+async fn auth_input_validation() {
+    let (app, _dir) = test_app();
+
+    // 1. Password length limits
+    // Under 8 characters
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "short", "name": "Tester"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "password must be at least 8 characters");
+
+    // Over 128 characters
+    let long_password = "p".repeat(129);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": long_password, "name": "Tester"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "password must be at most 128 characters");
+
+    // 2. Email length / format limits
+    // Too long email
+    let long_email = format!("{}@example.com", "e".repeat(243)); // 243 + 12 = 255 chars
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22", "name": "Tester"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "invalid email address");
+
+    // 3. Display name limit during registration
+    let long_name = "n".repeat(101);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "valid@example.com", "password": "hunter22hunter22", "name": long_name}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "display name must be at most 100 characters");
+
+    // 4. Password limit during login
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], "invalid email or password");
+}
+
+#[tokio::test]
 async fn auth_required_401s_are_json() {
     let (app, _dir) = test_app();
     for req in [
@@ -670,6 +750,7 @@ async fn patch_me_validation() {
         (json!({"settings": {"wpm": 5000}}), "wpm"),
         (json!({"settings": {"theme": "neon"}}), "theme"),
         (json!({"name": "   "}), "name"),
+        (json!({"name": "n".repeat(101)}), "display name"),
     ] {
         let resp = send(
             &app,
