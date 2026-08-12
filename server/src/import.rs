@@ -554,11 +554,13 @@ pub async fn guarded_fetch(raw_url: &str) -> Result<(String, Vec<u8>, String), A
             .build()
             .map_err(AppError::internal)?;
 
-        let mut resp = client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| AppError::bad_request(format!("could not fetch the URL: {e}")))?;
+        let mut resp = client.get(url.clone()).send().await.map_err(|e| {
+            // reqwest's Display is a chain of transport internals ("tcp connect
+            // error: Connection refused (os error 111)"). Clients render this
+            // string straight into the UI, so keep the detail in the log.
+            tracing::debug!("import fetch failed for {url}: {e}");
+            AppError::bad_request("could not reach that URL")
+        })?;
         let status = resp.status();
 
         if status.is_redirection() {
@@ -587,11 +589,10 @@ pub async fn guarded_fetch(raw_url: &str) -> Result<(String, Vec<u8>, String), A
             .to_ascii_lowercase();
 
         let mut body = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| AppError::bad_request(format!("error reading the page: {e}")))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            tracing::debug!("import read failed for {url}: {e}");
+            AppError::bad_request("the page stopped responding while loading")
+        })? {
             if body.len() + chunk.len() > IMPORT_LIMIT {
                 return Err(AppError::bad_request("the page exceeds the 25 MB limit"));
             }

@@ -88,13 +88,37 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(AppJson(value)),
             Err(rej) => {
+                // axum's own text names our Rust field types and serde's
+                // internals ("invalid type: integer `5`, expected a string at
+                // line 1 column 10"). That is a debugging detail, not copy to
+                // show a reader — clients render `error` verbatim. Keep the
+                // detail in the log and answer with something a human wrote.
+                tracing::debug!("json rejection: {}", rej.body_text());
                 // Malformed / mismatched JSON bodies are a plain 400 for us;
                 // keep 413 (too large) and 415 (wrong content type) as-is.
-                let status = match rej.status() {
-                    StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
-                    other => other,
+                let (status, message) = match &rej {
+                    JsonRejection::JsonDataError(_) => (
+                        StatusCode::BAD_REQUEST,
+                        "the request body is missing a required field or has the wrong type",
+                    ),
+                    JsonRejection::JsonSyntaxError(_) => {
+                        (StatusCode::BAD_REQUEST, "the request body is not valid JSON")
+                    }
+                    JsonRejection::MissingJsonContentType(_) => (
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "expected a JSON body (content-type: application/json)",
+                    ),
+                    _ => match rej.status() {
+                        StatusCode::PAYLOAD_TOO_LARGE => {
+                            (StatusCode::PAYLOAD_TOO_LARGE, "the request body is too large")
+                        }
+                        StatusCode::UNPROCESSABLE_ENTITY => {
+                            (StatusCode::BAD_REQUEST, "the request body could not be read")
+                        }
+                        other => (other, "the request body could not be read"),
+                    },
                 };
-                Err(AppError::Status(status, rej.body_text()))
+                Err(AppError::Status(status, message.into()))
             }
         }
     }
@@ -113,7 +137,15 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match axum::extract::Path::<T>::from_request_parts(parts, state).await {
             Ok(axum::extract::Path(value)) => Ok(AppPath(value)),
-            Err(rej) => Err(AppError::Status(rej.status(), rej.body_text())),
+            Err(rej) => {
+                // Same reasoning as `AppJson`: the raw text describes our route
+                // signature, which is nothing the caller can act on.
+                tracing::debug!("path rejection: {}", rej.body_text());
+                Err(AppError::Status(
+                    rej.status(),
+                    "the URL is not valid for this endpoint".into(),
+                ))
+            }
         }
     }
 }

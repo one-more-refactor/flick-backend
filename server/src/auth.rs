@@ -27,6 +27,15 @@ pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 const LOGIN_CODE_TTL_SECS: i64 = 10 * 60;
 const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 
+/// Bounds on the identity fields. Nothing here is a security boundary on its
+/// own — they exist because every one of these strings is stored, echoed back
+/// in `user_json`, and rendered in the web client, the TUI and the admin
+/// panel, and none of those want a megabyte-long name.
+pub(crate) const MAX_EMAIL_LEN: usize = 254; // RFC 5321 practical maximum
+pub(crate) const MAX_NAME_LEN: usize = 120;
+/// argon2 absorbs the whole password; an unbounded one is free server work.
+const MAX_PASSWORD_LEN: usize = 1024;
+
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
 pub(crate) static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
@@ -455,13 +464,23 @@ pub async fn register(
     AppJson(body): AppJson<RegisterBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
-    if email.len() < 3 || !email.contains('@') {
+    if email.len() < 3 || !email.contains('@') || email.len() > MAX_EMAIL_LEN {
         return Err(AppError::bad_request("invalid email address"));
     }
+    // Browsers cap these for us; the TUI, the extension and every direct API
+    // caller do not, so the bound has to live here.
     if body.password.len() < 8 {
         return Err(AppError::bad_request(
             "password must be at least 8 characters",
         ));
+    }
+    if body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::bad_request(
+            "password must be at most 1024 characters",
+        ));
+    }
+    if body.name.as_ref().is_some_and(|n| n.len() > MAX_NAME_LEN) {
+        return Err(AppError::bad_request("name is too long"));
     }
     // Contract: name is optional — default to the email's local part.
     let name = body
@@ -678,6 +697,9 @@ pub async fn update_me(
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(AppError::bad_request("name must not be empty"));
+        }
+        if name.len() > MAX_NAME_LEN {
+            return Err(AppError::bad_request("name is too long"));
         }
         user.name = name;
     }
