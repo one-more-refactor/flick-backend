@@ -505,12 +505,17 @@ async fn complete(
             let Some(email) = email else {
                 return Ok(Err("provider did not supply an email address"));
             };
+            // SECURITY: require verified email for brand-new account creation,
+            // not just for linking existing users. Without this check, an
+            // attacker controlling an unverified email at a real IdP could
+            // create a fresh flick account. Matches sentinel's stricter
+            // OIDC callback policy (sentinel/server/src/auth_oidc.rs:287-289).
+            if !email_verified {
+                return Ok(Err(
+                    "provider email is not verified; cannot create a new account",
+                ));
+            }
             if let Some(user) = db::user_by_email(c, &email)? {
-                if !email_verified {
-                    return Ok(Err(
-                        "an account with this email exists but the provider email is not verified",
-                    ));
-                }
                 db::link_identity(c, &provider_owned, &sub, &user.id, Some(&email))?;
                 return Ok(Ok(user));
             }
