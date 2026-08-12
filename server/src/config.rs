@@ -59,6 +59,15 @@ pub struct Config {
     pub admin_origin: Option<String>,
     /// Admin panel URL surfaced in /api/meta for the ADMIN menu link.
     pub admin_url: Option<String>,
+    /// Whether `CF-Connecting-IP` may be believed (FLICK_TRUST_CF_CONNECTING_IP).
+    ///
+    /// Only true when Cloudflare really is the layer in front: the edge sets
+    /// this header and strips any client-supplied copy, so it is trustworthy
+    /// *there* and nowhere else. Behind a plain reverse proxy nothing strips
+    /// it, and believing it lets a caller pick their own rate-limit bucket by
+    /// varying one header — which is the whole of the login throttle, since
+    /// there is no per-account lockout.
+    pub trust_cf_connecting_ip: bool,
 }
 
 /// Default web dist (CONTRACTS.md): first of `./web/dist`, `../web/dist`
@@ -82,6 +91,12 @@ fn env_var(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// A boolean env flag: `1`, `true`, `yes` or `on` (case-insensitive) enable it.
+fn env_flag(key: &str) -> bool {
+    env_var(key)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Client id + secret pair, present only when both env vars are set.
@@ -156,6 +171,7 @@ impl Config {
             admin_token: env_var("FLICK_ADMIN_TOKEN").filter(|t| !t.is_empty()),
             admin_origin: env_var("FLICK_ADMIN_ORIGIN").filter(|t| !t.is_empty()),
             admin_url: env_var("FLICK_ADMIN_URL").filter(|t| !t.is_empty()),
+            trust_cf_connecting_ip: env_flag("FLICK_TRUST_CF_CONNECTING_IP"),
         }
     }
 

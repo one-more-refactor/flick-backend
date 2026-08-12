@@ -34,6 +34,7 @@ fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
         admin_token: Some("test-admin-token".into()),
         admin_origin: None,
         admin_url: None,
+        trust_cf_connecting_ip: false,
     };
     let db = Db::open(&config.data_dir).expect("open db");
     let state = AppState::new(db, config);
@@ -73,6 +74,7 @@ fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::
         admin_token: Some("test-admin-token".into()),
         admin_origin: None,
         admin_url: None,
+        trust_cf_connecting_ip: false,
     };
     mutate(&mut config);
     let db = Db::open(&config.data_dir).expect("open db");
@@ -2753,13 +2755,19 @@ async fn xff_prepend_does_not_reset_the_bucket() {
 /// In the tunnel topology the peer is loopback and `cloudflared` sets no XFF
 /// at all, so an X-Forwarded-For on such a request is pure client input.
 /// CF-Connecting-IP is what the edge actually sets — it must win.
+///
+/// That is true only once the deployment has declared Cloudflare is in front
+/// (FLICK_TRUST_CF_CONNECTING_IP): the same header from a plain reverse proxy
+/// is just as forgeable as the XFF it would be overriding.
 #[tokio::test]
 async fn cf_connecting_ip_beats_a_spoofed_xff() {
     let limits = RateLimits {
         login: Rule::new(2, std::time::Duration::from_secs(300)),
         ..RateLimits::default()
     };
-    let (app, _dir) = test_app_with_limits(limits);
+    let (app, _dir) = test_app_with_limits_and_config(limits, |c| {
+        c.trust_cf_connecting_ip = true;
+    });
 
     for (i, spoof) in ["1.1.1.1", "2.2.2.2", "3.3.3.3"].iter().enumerate() {
         let mut req = login_request(Some(spoof));
@@ -3591,7 +3599,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3614,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
@@ -3615,4 +3631,119 @@ async fn import_html_rejects_non_http_urls() {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {url}");
     }
+}
+
+/// A test app whose rate limits AND config are both customized.
+fn test_app_with_limits_and_config(
+    limits: RateLimits,
+    mutate: impl FnOnce(&mut Config),
+) -> (Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = Config {
+        edition: Edition::Selfhost,
+        addr: "127.0.0.1:0".into(),
+        data_dir: dir.path().join("data"),
+        public_url: "http://localhost:8484".into(),
+        legacy_hosts: Vec::new(),
+        web_dist: dir.path().join("no-such-dist"),
+        oidc: None,
+        oidc_name: "SSO".into(),
+        oauth_google: None,
+        oauth_github: None,
+        smtp_url: None,
+        smtp_from: "flick <no-reply@localhost>".into(),
+        dropbox_app_key: None,
+        google_picker_api_key: None,
+        admin_token: Some("test-admin-token".into()),
+        admin_origin: None,
+        admin_url: None,
+        trust_cf_connecting_ip: false,
+    };
+    mutate(&mut config);
+    let db = Db::open(&config.data_dir).expect("open db");
+    let state = AppState::new(db, config).with_rate_limits(limits);
+    (app(state), dir)
+}
+
+fn login_request_cf(cf: &str, xff: Option<&str>) -> Request<Body> {
+    let mut req = login_request(xff);
+    req.headers_mut()
+        .insert("cf-connecting-ip", cf.parse().expect("header"));
+    req
+}
+
+/// `CF-Connecting-IP` is only believable when Cloudflare really is in front —
+/// it is the edge that strips any client-supplied copy. Behind a plain proxy
+/// nothing strips it, so by default it must not choose the bucket: otherwise
+/// one caller varies one header and the login throttle is gone (there is no
+/// per-account lockout behind it).
+#[tokio::test]
+async fn cf_connecting_ip_is_ignored_unless_explicitly_trusted() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+
+    // Same real client (per XFF), rotating a forged CF-Connecting-IP: the
+    // bucket must stay pinned to the XFF client and run out.
+    for _ in 0..2 {
+        let resp = send(
+            &app,
+            with_peer(
+                login_request_cf("198.51.100.1", Some("203.0.113.7")),
+                "127.0.0.1:9999",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = send(
+        &app,
+        with_peer(
+            login_request_cf("198.51.100.2", Some("203.0.113.7")),
+            "127.0.0.1:9999",
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a forged CF-Connecting-IP bought a fresh rate-limit bucket"
+    );
+}
+
+/// With the flag on (Cloudflare in front), the header is authoritative again.
+#[tokio::test]
+async fn cf_connecting_ip_buckets_per_client_when_trusted() {
+    let limits = RateLimits {
+        login: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits_and_config(limits, |c| {
+        c.trust_cf_connecting_ip = true;
+    });
+
+    for _ in 0..2 {
+        let resp = send(
+            &app,
+            with_peer(login_request_cf("198.51.100.1", None), "127.0.0.1:9999"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = send(
+        &app,
+        with_peer(login_request_cf("198.51.100.1", None), "127.0.0.1:9999"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A genuinely different edge client is a fresh bucket.
+    let resp = send(
+        &app,
+        with_peer(login_request_cf("198.51.100.9", None), "127.0.0.1:9999"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
