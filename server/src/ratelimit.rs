@@ -56,6 +56,9 @@ pub struct RateLimits {
     pub import_url: Rule,
     pub friend_add: Rule,
     pub admin_login: Rule,
+    /// Copying a shared book into your own library. Charges no upload
+    /// allowance by design, so this is the only ceiling on it.
+    pub shared_import: Rule,
     pub delete_me: Rule,
     pub export: Rule,
     /// The MCP endpoint as a whole. Individual tools that cost real work
@@ -76,6 +79,7 @@ impl Default for RateLimits {
             import_url: Rule::new(30, HOUR),
             friend_add: Rule::new(30, FIVE_MIN),
             admin_login: Rule::new(10, FIVE_MIN),
+            shared_import: Rule::new(60, HOUR),
             // Authed but destructive/expensive: a stolen cookie should not be
             // able to erase the account or pull the full export in a loop.
             delete_me: Rule::new(5, FIVE_MIN),
@@ -103,6 +107,11 @@ impl RateLimits {
             ("DELETE", "/api/auth/me") => Some(("delete_me", self.delete_me)),
             ("GET", "/api/auth/export") => Some(("export", self.export)),
             ("POST", "/mcp") => Some(("mcp", self.mcp)),
+            // `/api/shared/{token}/import` — the token varies, so this one
+            // cannot be an exact match like the rest.
+            ("POST", p) if p.starts_with("/api/shared/") && p.ends_with("/import") => {
+                Some(("shared_import", self.shared_import))
+            }
             _ => None,
         }
     }
