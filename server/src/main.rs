@@ -36,6 +36,17 @@ async fn main() {
             "web dist not found — build it (cd web && bun run build) or set FLICK_WEB_DIST"
         );
     }
+    if config.trust_cf_connecting_ip {
+        tracing::info!(
+            "trusting CF-Connecting-IP for the client IP — only correct with Cloudflare in front"
+        );
+    } else {
+        tracing::info!(
+            "ignoring CF-Connecting-IP (set FLICK_TRUST_CF_CONNECTING_IP=1 when, and only when, \
+             Cloudflare terminates in front of this server — otherwise rate limits bucket per \
+             X-Forwarded-For)"
+        );
+    }
     let state = AppState::new(db, config);
 
     let listener = tokio::net::TcpListener::bind(&addr)

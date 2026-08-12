@@ -196,7 +196,17 @@ fn trusted_proxy(ip: IpAddr) -> bool {
 /// over loopback and does *not* set `X-Forwarded-For`, so in the tunnel
 /// topology XFF is nothing but attacker-controlled bytes — prefer this header
 /// and fall back to XFF for the bare-Caddy self-hosted topology.
-fn cf_connecting_ip(headers: &HeaderMap) -> Option<IpAddr> {
+///
+/// That preference is only sound when Cloudflare is genuinely in front. Behind
+/// a plain reverse proxy nothing strips the header, so believing it hands the
+/// caller their own rate-limit bucket for the cost of one header — and since
+/// `/api/auth/login` has no per-account lockout, the per-IP window *is* the
+/// brute-force defence. Hence the explicit opt-in
+/// (`FLICK_TRUST_CF_CONNECTING_IP`) rather than trusting it by shape.
+fn cf_connecting_ip(headers: &HeaderMap, trusted: bool) -> Option<IpAddr> {
+    if !trusted {
+        return None;
+    }
     headers
         .get("cf-connecting-ip")?
         .to_str()
@@ -233,41 +243,42 @@ fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
 
 /// The client IP behind a peer we already decided to trust. Kept in one place
 /// so the rate limiter and the signup-attribution path cannot drift apart.
-fn client_behind_trusted_peer(headers: &HeaderMap) -> Option<IpAddr> {
-    cf_connecting_ip(headers).or_else(|| forwarded_ip(headers))
+fn client_behind_trusted_peer(headers: &HeaderMap, trust_cf: bool) -> Option<IpAddr> {
+    cf_connecting_ip(headers, trust_cf).or_else(|| forwarded_ip(headers))
 }
 
 /// Infallible extractor: the request's client IP under the same trust rules
 /// as the rate limiter ("unknown" without ConnectInfo, e.g. in tests).
 pub struct ClientIp(pub String);
 
-impl<S> axum::extract::FromRequestParts<S> for ClientIp
-where
-    S: Send + Sync,
-{
+impl axum::extract::FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &S,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0);
-        Ok(ClientIp(client_ip(&parts.headers, peer)))
+        Ok(ClientIp(client_ip(
+            &parts.headers,
+            peer,
+            state.config.trust_cf_connecting_ip,
+        )))
     }
 }
 
 /// Client IP from headers + optional peer (signup attribution, referral
 /// anti-abuse). Same trust rules as the rate limiter.
-pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_cf: bool) -> String {
     match peer {
         None => "unknown".into(),
         Some(peer) => {
             let peer_ip = peer.ip().to_canonical();
             if trusted_proxy(peer_ip) {
-                if let Some(client) = client_behind_trusted_peer(headers) {
+                if let Some(client) = client_behind_trusted_peer(headers, trust_cf) {
                     return client.to_canonical().to_string();
                 }
             }
@@ -280,14 +291,14 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
 /// peer is a trusted proxy, else the peer IP itself. Without `ConnectInfo`
 /// (router driven directly, e.g. `oneshot` in tests) the key is `"unknown"`
 /// — never a panic.
-fn client_key(req: &Request) -> String {
+fn client_key(req: &Request, trust_cf: bool) -> String {
     let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
         return "unknown".into();
     };
     // Canonicalize so an IPv4-mapped ::ffff:a.b.c.d peer matches the v4 rules.
     let peer_ip = peer.ip().to_canonical();
     if trusted_proxy(peer_ip) {
-        if let Some(client) = client_behind_trusted_peer(req.headers()) {
+        if let Some(client) = client_behind_trusted_peer(req.headers(), trust_cf) {
             return client.to_canonical().to_string();
         }
     }
@@ -306,7 +317,7 @@ pub async fn rate_limit(State(state): State<AppState>, req: Request, next: Next)
     else {
         return next.run(req).await;
     };
-    let key = client_key(&req);
+    let key = client_key(&req, state.config.trust_cf_connecting_ip);
     match state.limiter.check(endpoint, rule, &key) {
         Ok(()) => next.run(req).await,
         Err(retry_after) => {
