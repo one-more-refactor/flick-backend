@@ -670,6 +670,7 @@ async fn patch_me_validation() {
         (json!({"settings": {"wpm": 5000}}), "wpm"),
         (json!({"settings": {"theme": "neon"}}), "theme"),
         (json!({"name": "   "}), "name"),
+        (json!({"name": "a".repeat(101)}), "name"),
     ] {
         let resp = send(
             &app,
@@ -688,6 +689,157 @@ async fn patch_me_validation() {
     let me = body_json(send(&app, bare_request("GET", "/api/auth/me", Some(&cookie))).await).await;
     assert_eq!(me["username"], Value::Null);
     assert_eq!(me["settings"]["wpm"], 350);
+}
+
+#[tokio::test]
+async fn auth_input_validation() {
+    let (app, _dir) = test_app();
+
+    // 1. Register with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22",
+                "name": "Ada"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 2. Register with too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "ada@example.com",
+                "password": "a".repeat(129),
+                "name": "Ada"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("password"));
+
+    // 3. Register with too long name
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({
+                "email": "ada@example.com",
+                "password": "hunter22hunter22",
+                "name": "a".repeat(101)
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("name"));
+
+    // 4. Login with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 5. Login with too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": "ada@example.com",
+                "password": "a".repeat(129)
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("password"));
+
+    // 6. Lookup with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250))
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 7. Admin login with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 8. Admin login with too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": "admin@example.com",
+                "password": "a".repeat(129)
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("password"));
 }
 
 // --------------------------------------------------------- v0.3: guests
