@@ -741,6 +741,29 @@ fn row_book(r: &Row) -> rusqlite::Result<Book> {
 const BOOK_COLS: &str = "id, title, source, word_count, position, created_at, \
                          last_read_at, author, url, favicon, excerpt, category, tags";
 
+/// An existing live copy of a shared book in this user's library, matched the
+/// way the share contract describes: same origin (`source = 'shared'`), same
+/// title, same word count. Lets a repeated import return the copy the user
+/// already has instead of minting another one.
+pub fn shared_copy(
+    c: &Connection,
+    user_id: &str,
+    title: &str,
+    word_count: i64,
+) -> rusqlite::Result<Option<Book>> {
+    c.query_row(
+        &format!(
+            "SELECT {BOOK_COLS} FROM books
+             WHERE user_id = ?1 AND source = 'shared' AND title = ?2 AND word_count = ?3
+               AND deleted_at IS NULL
+             ORDER BY created_at LIMIT 1"
+        ),
+        params![user_id, title, word_count],
+        row_book,
+    )
+    .optional()
+}
+
 pub fn insert_book(
     c: &Connection,
     user_id: &str,

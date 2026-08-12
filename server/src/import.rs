@@ -20,6 +20,12 @@ use crate::error::AppError;
 /// Fetch/import body cap (CONTRACTS.md: 25 MB), shared by URL fetch + the
 /// supplied-HTML path.
 pub const IMPORT_LIMIT: usize = 25 * 1024 * 1024;
+/// Ceiling on plaintext extracted from one upload. `IMPORT_LIMIT`/`UPLOAD_LIMIT`
+/// bound the bytes that arrive; a zip (EPUB) decides for itself what those
+/// inflate to, so the decompressed side needs its own bound. Comfortably above
+/// any real book — War and Peace is ~3.2 MB of plain text.
+pub const MAX_EXTRACTED_TEXT: usize = 32 * 1024 * 1024;
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = "flick-server";
@@ -81,8 +87,7 @@ pub fn html_to_text(html: &str) -> String {
                 .collect();
             if matches!(name.as_str(), "script" | "style") && !raw.starts_with('/') {
                 // Skip to the matching close tag.
-                let close = format!("</{name}");
-                if let Some(end) = html[i..].to_ascii_lowercase().find(&close) {
+                if let Some(end) = find_close_tag(&html[i..], &name) {
                     i += end;
                     // Advance past that close tag's '>'.
                     if let Some(gt) = html[i..].find('>') {
@@ -115,6 +120,29 @@ pub fn html_to_text(html: &str) -> String {
         }
     }
     normalize_paragraphs(&decode_entities(&out))
+}
+
+/// Byte offset of the next `</name` in `haystack`, matched case-insensitively.
+///
+/// This used to be `haystack.to_ascii_lowercase().find(...)`, which copies and
+/// lowercases the entire remaining document once per `<script>`/`<style>` tag
+/// encountered — O(n) allocation per tag, so O(n²) over a tag-dense document,
+/// regardless of how near the closing tag actually is. Scanning in place stops
+/// at the first match instead, which for well-formed markup is a few bytes
+/// away. An EPUB chapter is attacker-shaped input arriving through a zip, so
+/// the difference is not academic.
+fn find_close_tag(haystack: &str, name: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let name = name.as_bytes();
+    let needle = name.len() + 2; // "</" + name
+    if bytes.len() < needle {
+        return None;
+    }
+    (0..=bytes.len() - needle).find(|&i| {
+        bytes[i] == b'<'
+            && bytes[i + 1] == b'/'
+            && bytes[i + 2..i + needle].eq_ignore_ascii_case(name)
+    })
 }
 
 fn utf8_len(first: u8) -> usize {
@@ -348,10 +376,19 @@ fn epub_to_prepared(bytes: &[u8]) -> Option<Prepared> {
         .filter(|a| !a.is_empty());
 
     let mut chapters: Vec<String> = Vec::new();
+    let mut total = 0usize;
     let mut reader = epub.reader();
     while let Some(Ok(content)) = reader.read_next() {
+        // An EPUB is a zip: UPLOAD_LIMIT bounds what arrives on the wire, not
+        // what it inflates to. Stop accumulating once we hold a book's worth
+        // of text rather than letting a high-ratio archive size the allocation.
+        if total >= MAX_EXTRACTED_TEXT {
+            tracing::debug!("epub text truncated at {MAX_EXTRACTED_TEXT} bytes");
+            break;
+        }
         let text = html_to_text(content.content());
         if !text.trim().is_empty() {
+            total += text.len();
             chapters.push(text);
         }
     }

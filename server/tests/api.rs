@@ -3591,7 +3591,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3606,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
@@ -3615,4 +3623,150 @@ async fn import_html_rejects_non_http_urls() {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {url}");
     }
+}
+
+// ------------------------------------------------ import resource ceilings
+
+/// Importing the same share link twice returns the copy already in the
+/// library. Each call used to duplicate the timeline blob and the full text,
+/// and the route charges no upload allowance — so a loop over one link grew
+/// the database with no ceiling at all.
+#[tokio::test]
+async fn shared_import_is_idempotent() {
+    let (app, _dir) = test_app();
+    let owner = register(&app, "shareowner@example.com").await;
+    let book = create_paste_book(&app, &owner, Some("Shared Book"), "alpha beta gamma delta").await;
+    let id = book["id"].as_str().expect("id");
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/books/{id}/share"),
+            Some(&owner),
+            json!({}),
+        ),
+    )
+    .await;
+    let token = body_json(resp).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let victim = register(&app, "sharevictim@example.com").await;
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..10 {
+        let resp = send(
+            &app,
+            bare_request(
+                "POST",
+                &format!("/api/shared/{token}/import"),
+                Some(&victim),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        ids.insert(
+            body_json(resp).await["id"]
+                .as_str()
+                .expect("id")
+                .to_string(),
+        );
+    }
+    assert_eq!(ids.len(), 1, "each import minted a new copy");
+
+    let list = body_json(send(&app, bare_request("GET", "/api/books", Some(&victim))).await).await;
+    let copies = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|b| b["source"] == "shared")
+        .count();
+    assert_eq!(
+        copies, 1,
+        "library holds {copies} copies of one shared book"
+    );
+}
+
+/// `/api/shared/{token}/import` charges a bucket like every other route that
+/// creates rows. The token varies, so the limiter has to match it by shape.
+#[tokio::test]
+async fn shared_import_is_rate_limited() {
+    let limits = RateLimits {
+        shared_import: Rule::new(2, std::time::Duration::from_secs(300)),
+        ..RateLimits::default()
+    };
+    let (app, _dir) = test_app_with_limits(limits);
+    let owner = register(&app, "rlowner@example.com").await;
+    let book = create_paste_book(&app, &owner, Some("RL"), "alpha beta gamma delta").await;
+    let id = book["id"].as_str().expect("id");
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/books/{id}/share"),
+            Some(&owner),
+            json!({}),
+        ),
+    )
+    .await;
+    let token = body_json(resp).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let victim = register(&app, "rlvictim@example.com").await;
+    for _ in 0..2 {
+        let resp = send(
+            &app,
+            bare_request(
+                "POST",
+                &format!("/api/shared/{token}/import"),
+                Some(&victim),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    let resp = send(
+        &app,
+        bare_request(
+            "POST",
+            &format!("/api/shared/{token}/import"),
+            Some(&victim),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// `html_to_text` must stay linear in the size of the document. It used to
+/// lowercase the whole remaining input once per `<script>`/`<style>` tag, so a
+/// tag-dense EPUB chapter cost quadratic time — an 11 KB upload burned ten
+/// seconds of a blocking thread.
+#[tokio::test]
+async fn html_to_text_stays_linear_in_document_size() {
+    use std::time::Instant;
+
+    let elapsed = |tags: usize| {
+        let filler = "a ".repeat(200);
+        let doc: String = (0..tags)
+            .map(|_| format!("<script>x</script>{filler}"))
+            .collect();
+        let started = Instant::now();
+        let out = flick_server::import::html_to_text(&doc);
+        assert!(!out.is_empty());
+        assert!(!out.contains('x'), "script body leaked into the text");
+        started.elapsed().as_secs_f64()
+    };
+
+    // Warm up, then compare 4x the input. Quadratic would be ~16x the time;
+    // allow a generous 8x so this is not a flaky timing test.
+    let _ = elapsed(500);
+    let small = elapsed(1_000).max(1e-6);
+    let large = elapsed(4_000);
+    assert!(
+        large < small * 8.0,
+        "scaling looks super-linear: 1k tags {small:.4}s vs 4k tags {large:.4}s"
+    );
 }

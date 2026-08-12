@@ -884,6 +884,14 @@ pub async fn shared_import(
             if mode == "read" {
                 return Ok(Some(Err(())));
             }
+            // Idempotent per the contract: importing the same link twice hands
+            // back the copy already in the library. Without this each call
+            // duplicated the timeline blob and the full text, and since this
+            // route charges no upload allowance and has no rate limit, a loop
+            // over one link grew the database without bound.
+            if let Some(existing) = db::shared_copy(c, &user.id, &src.title, src.word_count)? {
+                return Ok(Some(Ok(existing)));
+            }
             let timeline =
                 db::get_timeline(c, &owner_id, &src.id)?.expect("shared book has a timeline");
             let text = db::book_text(c, &owner_id, &src.id)?;
