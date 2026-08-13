@@ -690,6 +690,135 @@ async fn patch_me_validation() {
     assert_eq!(me["settings"]["wpm"], 350);
 }
 
+#[tokio::test]
+async fn auth_endpoints_input_validation() {
+    let (app, _dir) = test_app();
+
+    // 1. login with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 2. login with too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({
+                "email": "ada@example.com",
+                "password": "a".repeat(1025)
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("password"));
+
+    // 3. lookup with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250))
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 4. code_request with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250))
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 5. code_verify with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "code": "123456"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 6. admin login with too long email
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": format!("{}@example.com", "a".repeat(250)),
+                "password": "hunter22hunter22"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("email"));
+
+    // 7. admin login with too long password
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({
+                "email": "admin@example.com",
+                "password": "a".repeat(1025)
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert!(err["error"].as_str().expect("msg").contains("password"));
+}
+
 // --------------------------------------------------------- v0.3: guests
 
 #[tokio::test]
@@ -3442,4 +3571,185 @@ async fn mcp_speaks_json_rpc_properly() {
     // GET has no stream to give.
     let resp = send(&app, bare_request("GET", "/mcp", None)).await;
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ------------------------------------------------- input-boundary hardening
+
+/// Error copy is written for readers, not lifted from serde. A client that
+/// sends the wrong type must not learn our field names or Rust types back —
+/// every client renders `error` verbatim.
+#[tokio::test]
+async fn json_errors_do_not_leak_parser_internals() {
+    let (app, _dir) = test_app();
+
+    for body in [
+        json!({"email": 5, "password": "hunter22hunter22"}),
+        json!({"email": "a@b.co"}), // missing password
+    ] {
+        let resp = send(&app, json_request("POST", "/api/auth/login", None, body)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let message = body_json(resp).await["error"]
+            .as_str()
+            .expect("string error")
+            .to_string();
+        for leak in [
+            "Failed to deserialize",
+            "invalid type",
+            "expected a string",
+            "line 1 column",
+            "missing field",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "parser internals leaked to the client: {message}"
+            );
+        }
+    }
+}
+
+/// An unrecognised share mode is a 400, never a silent downgrade to the
+/// permissive one: a typo'd "read-only" must not mint an importable link.
+#[tokio::test]
+async fn unknown_share_mode_is_rejected() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "sharemode@example.com").await;
+    let book = create_paste_book(&app, &cookie, Some("M"), "alpha beta gamma delta").await;
+    let id = book["id"].as_str().expect("id");
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            &format!("/api/books/{id}/share"),
+            Some(&cookie),
+            json!({"mode": "read-only"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The two spellings we do accept still work.
+    for mode in ["read", "import"] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                &format!("/api/books/{id}/share"),
+                Some(&cookie),
+                json!({ "mode": mode }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["mode"], mode);
+    }
+}
+
+/// The browser caps these fields; the TUI, the extension and curl do not.
+#[tokio::test]
+async fn identity_fields_are_length_bounded() {
+    let (app, _dir) = test_app();
+
+    let long_email = format!("{}@example.com", "x".repeat(300));
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": long_email, "password": "hunter22hunter22"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "long@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "name@example.com", "password": "hunter22hunter22",
+                   "name": "n".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // and the same bound on the profile patch
+    let cookie = register(&app, "patchlen@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "PATCH",
+            "/api/auth/me",
+            Some(&cookie),
+            json!({"name": "n".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A book title is bounded however it arrived — including via the upload
+/// filename, which no browser constrains.
+#[tokio::test]
+async fn upload_filename_cannot_set_an_unbounded_title() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "filename@example.com").await;
+    let filename = format!("{}.txt", "T".repeat(4000));
+    let resp = send(
+        &app,
+        upload_request(&cookie, &filename, b"alpha beta gamma delta epsilon"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let title = body_json(resp).await["title"]
+        .as_str()
+        .expect("title")
+        .to_string();
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
+}
+
+/// `/import/html` never fetches its url, but it does store and echo it as the
+/// article's source link — so it gets the same scheme check as everything else
+/// that ends up in front of a reader.
+#[tokio::test]
+async fn import_html_rejects_non_http_urls() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "importhtml@example.com").await;
+
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/import/html",
+                Some(&cookie),
+                json!({"url": url, "html": "<html><body><p>hello world</p></body></html>"}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {url}");
+    }
 }

@@ -75,9 +75,20 @@ fn default_title(text: &str) -> String {
     }
 }
 
+/// A stored title has to survive a library row, a TUI line and an admin table.
+/// Titles arrive from JSON, a multipart field, an upload's filename, EPUB
+/// metadata and readability output — the last three are attacker-shaped, so
+/// the cap belongs here rather than at each call site.
+const MAX_TITLE_CHARS: usize = 200;
+
+/// Source links are stored and rendered as the book's origin; browsers stop
+/// well before this, but direct API callers do not.
+const MAX_URL_LEN: usize = 2048;
+
 fn clean_title(title: Option<String>) -> Option<String> {
     title
-        .map(|t| t.trim().to_string())
+        .map(|t| t.trim().chars().take(MAX_TITLE_CHARS).collect::<String>())
+        .map(|t| t.trim_end().to_string())
         .filter(|t| !t.is_empty())
 }
 
@@ -530,6 +541,16 @@ pub async fn import_html(
     if url.is_empty() {
         return Err(AppError::bad_request("url must not be empty"));
     }
+    // This one is never fetched (the client already captured the HTML), so it
+    // skips `guarded_fetch`'s scheme check — but it *is* stored on the book and
+    // handed back to every client as the article's source link. Hold it to the
+    // same bar the admin announcement link already meets.
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(AppError::bad_request("url must be http(s)"));
+    }
+    if url.len() > MAX_URL_LEN {
+        return Err(AppError::bad_request("url is too long"));
+    }
     let title = clean_title(body.title);
     let mut prepared = import::extract_article(body.html, url, "html").await?;
     if title.is_some() {
@@ -761,12 +782,18 @@ pub async fn share_book(
     AppPath(id): AppPath<String>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
-    // Absent/blank body defaults to the copy-into-library behaviour.
-    let mode = serde_json::from_slice::<ShareBody>(&body)
+    // Absent/blank body defaults to the copy-into-library behaviour, but a
+    // mode that was *given* and is not recognised must fail loudly: silently
+    // coercing it to "import" turns a typo'd read-only share into a link that
+    // hands out copies of the book.
+    let mode = match serde_json::from_slice::<ShareBody>(&body)
         .ok()
         .and_then(|b| b.mode)
-        .filter(|m| m == "read" || m == "import")
-        .unwrap_or_else(|| "import".into());
+    {
+        None => "import".to_string(),
+        Some(m) if m == "read" || m == "import" => m,
+        Some(_) => return Err(AppError::bad_request("mode must be \"read\" or \"import\"")),
+    };
     let fresh = random_token(12);
     let mode_stored = mode.clone();
     let token = state
