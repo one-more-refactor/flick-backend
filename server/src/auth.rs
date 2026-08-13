@@ -32,9 +32,9 @@ const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 /// in `user_json`, and rendered in the web client, the TUI and the admin
 /// panel, and none of those want a megabyte-long name.
 pub(crate) const MAX_EMAIL_LEN: usize = 254; // RFC 5321 practical maximum
-pub(crate) const MAX_NAME_LEN: usize = 120;
+pub(crate) const MAX_NAME_LEN: usize = 100;
 /// argon2 absorbs the whole password; an unbounded one is free server work.
-const MAX_PASSWORD_LEN: usize = 1024;
+pub(crate) const MAX_PASSWORD_LEN: usize = 128;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
@@ -476,7 +476,7 @@ pub async fn register(
     }
     if body.password.len() > MAX_PASSWORD_LEN {
         return Err(AppError::bad_request(
-            "password must be at most 1024 characters",
+            "password must be at most 128 characters",
         ));
     }
     if body.name.as_ref().is_some_and(|n| n.len() > MAX_NAME_LEN) {
@@ -542,6 +542,12 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't

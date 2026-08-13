@@ -3572,6 +3572,45 @@ async fn identity_fields_are_length_bounded() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // password length check on register (must be at most 128 characters)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/register",
+            None,
+            json!({"email": "longpw@example.com", "password": "p".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // password length check on login (must be at most 128 characters)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "patchlen@example.com", "password": "p".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // password length check on admin login (must be at most 128 characters)
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "root@example.com", "password": "p".repeat(129)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// A book title is bounded however it arrived — including via the upload
@@ -3591,7 +3630,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3645,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(

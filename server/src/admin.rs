@@ -94,6 +94,9 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if body.password.len() > crate::auth::MAX_PASSWORD_LEN {
+        return Err(AppError::Unauthorized);
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     let password = body.password;
