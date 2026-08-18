@@ -3559,6 +3559,56 @@ async fn identity_fields_are_length_bounded() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    // bounds on user login inputs
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": format!("{}@example.com", "x".repeat(300)), "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "user@example.com", "password": "x".repeat(2000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // bounds on admin login inputs
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": format!("{}@example.com", "x".repeat(300)), "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": "x".repeat(2000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // and the same bound on the profile patch
     let cookie = register(&app, "patchlen@example.com").await;
     let resp = send(
@@ -3591,7 +3641,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3656,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
