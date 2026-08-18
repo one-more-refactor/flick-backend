@@ -34,7 +34,7 @@ const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 pub(crate) const MAX_EMAIL_LEN: usize = 254; // RFC 5321 practical maximum
 pub(crate) const MAX_NAME_LEN: usize = 120;
 /// argon2 absorbs the whole password; an unbounded one is free server work.
-const MAX_PASSWORD_LEN: usize = 1024;
+pub(crate) const MAX_PASSWORD_LEN: usize = 1024;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
@@ -542,6 +542,9 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::bad_request("invalid email or password format"));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
