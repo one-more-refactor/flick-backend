@@ -48,6 +48,9 @@ pub async fn add(
     AuthUser(user): AuthUser,
     AppJson(body): AppJson<AddBody>,
 ) -> Result<StatusCode, AppError> {
+    if body.code.len() > 64 {
+        return Err(AppError::NotFound);
+    }
     let code = body.code.trim().trim_start_matches("/f/").to_string();
     let now = now_secs();
     let uid = user.id.clone();
