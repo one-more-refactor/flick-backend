@@ -318,8 +318,6 @@ async fn bad_json_bodies_get_json_errors() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-
-
     // empty text
     let resp = send(
         &app,
@@ -3528,7 +3526,12 @@ async fn identity_fields_are_length_bounded() {
     // lookup, code_request, code_verify, login length bounds
     let resp = send(
         &app,
-        json_request("POST", "/api/auth/lookup", None, json!({"email": long_email})),
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": long_email}),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -3649,7 +3652,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3660,7 +3667,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
