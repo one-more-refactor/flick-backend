@@ -318,6 +318,8 @@ async fn bad_json_bodies_get_json_errors() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+
+
     // empty text
     let resp = send(
         &app,
@@ -3522,6 +3524,62 @@ async fn identity_fields_are_length_bounded() {
     let (app, _dir) = test_app();
 
     let long_email = format!("{}@example.com", "x".repeat(300));
+
+    // lookup, code_request, code_verify, login length bounds
+    let resp = send(
+        &app,
+        json_request("POST", "/api/auth/lookup", None, json!({"email": long_email})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "valid@example.com", "code": "x".repeat(20)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "valid@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "valid@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = send(
         &app,
         json_request(
