@@ -34,7 +34,8 @@ const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 pub(crate) const MAX_EMAIL_LEN: usize = 254; // RFC 5321 practical maximum
 pub(crate) const MAX_NAME_LEN: usize = 120;
 /// argon2 absorbs the whole password; an unbounded one is free server work.
-const MAX_PASSWORD_LEN: usize = 1024;
+pub(crate) const MAX_PASSWORD_LEN: usize = 1024;
+pub(crate) const MAX_CODE_LEN: usize = 12;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
@@ -335,6 +336,12 @@ pub async fn lookup(
     AppJson(body): AppJson<LookupBody>,
 ) -> Result<Json<Value>, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN {
+        return Ok(Json(json!({
+            "exists": false,
+            "methods": Vec::<String>::new(),
+        })));
+    }
     let methods = state
         .db
         .call(move |c| {
@@ -383,6 +390,9 @@ pub async fn code_request(
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let lookup = email.clone();
     let exists = state
         .db
@@ -417,6 +427,9 @@ pub async fn code_verify(
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN || body.code.trim().len() > MAX_CODE_LEN {
+        return Err(AppError::bad_request("invalid code"));
+    }
     let presented_hash = sha256_hex(body.code.trim());
     let now = now_secs();
     let user = state
@@ -542,6 +555,13 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    // Validate input length before DB query or Argon2 hashing to prevent CPU/DB exhaustion DoS.
+    if email.len() > MAX_EMAIL_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
