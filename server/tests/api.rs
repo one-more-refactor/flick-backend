@@ -914,6 +914,187 @@ async fn login_code_roundtrip() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Bounded email/password check on auth lookup, code request, code verify, login, and admin login
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": long_email, "code": "123456"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "test@example.com", "code": "x".repeat(20)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": long_email, "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "test@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": long_email, "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": long_email, "code": "123456"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "test@example.com", "code": "x".repeat(20)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": long_email, "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "test@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": long_email, "password": "password"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": "x".repeat(5000)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ------------------------------------------------ v0.3: accent + lang
