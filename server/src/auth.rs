@@ -335,6 +335,12 @@ pub async fn lookup(
     AppJson(body): AppJson<LookupBody>,
 ) -> Result<Json<Value>, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN {
+        return Ok(Json(json!({
+            "exists": false,
+            "methods": Vec::<String>::new(),
+        })));
+    }
     let methods = state
         .db
         .call(move |c| {
@@ -383,6 +389,9 @@ pub async fn code_request(
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let lookup = email.clone();
     let exists = state
         .db
@@ -417,7 +426,11 @@ pub async fn code_verify(
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
-    let presented_hash = sha256_hex(body.code.trim());
+    let code = body.code.trim();
+    if email.len() > MAX_EMAIL_LEN || code.len() > 12 {
+        return Err(AppError::bad_request("invalid code"));
+    }
+    let presented_hash = sha256_hex(code);
     let now = now_secs();
     let user = state
         .db
@@ -542,6 +555,12 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     // Always verify against some argon2 hash so response timing doesn't
