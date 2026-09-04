@@ -88,13 +88,14 @@ fn hash_ip(ip: &str) -> String {
     }
 }
 
-/// Constant-time equality so code verification can't be timed byte-by-byte.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Compare two secrets without leaking anything through timing — length
+/// included. SHA-256 hashes both sides to 32 bytes first so comparison
+/// length is always uniform.
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).unwrap_u8() == 1
+    let a_hash = Sha256::digest(a.as_bytes());
+    let b_hash = Sha256::digest(b.as_bytes());
+    bool::from(a_hash.ct_eq(&b_hash))
 }
 
 /// Extract a cookie value from request headers.
@@ -430,7 +431,7 @@ pub async fn code_verify(
                 return Ok(None);
             }
             db::bump_login_code_attempts(c, &email)?;
-            if !ct_eq(code_hash.as_bytes(), presented_hash.as_bytes()) {
+            if !constant_eq(&code_hash, &presented_hash) {
                 if attempts + 1 >= LOGIN_CODE_MAX_ATTEMPTS {
                     db::delete_login_code(c, &email)?;
                 }
