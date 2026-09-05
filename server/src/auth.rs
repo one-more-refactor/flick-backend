@@ -88,13 +88,13 @@ fn hash_ip(ip: &str) -> String {
     }
 }
 
-/// Constant-time equality so code verification can't be timed byte-by-byte.
+/// Constant-time equality so code verification can't be timed byte-by-byte or by length.
+/// Hashing both sides to a fixed 32-byte digest first ensures identical work for any input lengths.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).unwrap_u8() == 1
+    let a_hash = Sha256::digest(a);
+    let b_hash = Sha256::digest(b);
+    bool::from(a_hash.ct_eq(&b_hash))
 }
 
 /// Extract a cookie value from request headers.
