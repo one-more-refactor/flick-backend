@@ -101,20 +101,23 @@ where
                         StatusCode::BAD_REQUEST,
                         "the request body is missing a required field or has the wrong type",
                     ),
-                    JsonRejection::JsonSyntaxError(_) => {
-                        (StatusCode::BAD_REQUEST, "the request body is not valid JSON")
-                    }
+                    JsonRejection::JsonSyntaxError(_) => (
+                        StatusCode::BAD_REQUEST,
+                        "the request body is not valid JSON",
+                    ),
                     JsonRejection::MissingJsonContentType(_) => (
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
                         "expected a JSON body (content-type: application/json)",
                     ),
                     _ => match rej.status() {
-                        StatusCode::PAYLOAD_TOO_LARGE => {
-                            (StatusCode::PAYLOAD_TOO_LARGE, "the request body is too large")
-                        }
-                        StatusCode::UNPROCESSABLE_ENTITY => {
-                            (StatusCode::BAD_REQUEST, "the request body could not be read")
-                        }
+                        StatusCode::PAYLOAD_TOO_LARGE => (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "the request body is too large",
+                        ),
+                        StatusCode::UNPROCESSABLE_ENTITY => (
+                            StatusCode::BAD_REQUEST,
+                            "the request body could not be read",
+                        ),
                         other => (other, "the request body could not be read"),
                     },
                 };
