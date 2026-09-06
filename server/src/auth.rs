@@ -34,7 +34,7 @@ const LOGIN_CODE_MAX_ATTEMPTS: i64 = 5;
 pub(crate) const MAX_EMAIL_LEN: usize = 254; // RFC 5321 practical maximum
 pub(crate) const MAX_NAME_LEN: usize = 120;
 /// argon2 absorbs the whole password; an unbounded one is free server work.
-const MAX_PASSWORD_LEN: usize = 1024;
+pub(crate) const MAX_PASSWORD_LEN: usize = 1024;
 
 /// Hash of a throwaway password, verified when the user doesn't exist so
 /// login latency doesn't reveal whether an email is registered.
@@ -334,6 +334,9 @@ pub async fn lookup(
     State(state): State<AppState>,
     AppJson(body): AppJson<LookupBody>,
 ) -> Result<Json<Value>, AppError> {
+    if body.email.len() > MAX_EMAIL_LEN {
+        return Err(AppError::bad_request("email is too long"));
+    }
     let email = body.email.trim().to_lowercase();
     let methods = state
         .db
@@ -382,6 +385,9 @@ pub async fn code_request(
     State(state): State<AppState>,
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
+    if body.email.len() > MAX_EMAIL_LEN {
+        return Err(AppError::bad_request("email is too long"));
+    }
     let email = body.email.trim().to_lowercase();
     let lookup = email.clone();
     let exists = state
@@ -416,6 +422,9 @@ pub async fn code_verify(
     headers: HeaderMap,
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
+    if body.email.len() > MAX_EMAIL_LEN || body.code.len() > 12 {
+        return Err(AppError::bad_request("invalid code"));
+    }
     let email = body.email.trim().to_lowercase();
     let presented_hash = sha256_hex(body.code.trim());
     let now = now_secs();
@@ -541,6 +550,12 @@ pub async fn login(
     headers: HeaderMap,
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
+    if body.email.len() > MAX_EMAIL_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::Status(
+            StatusCode::UNAUTHORIZED,
+            "invalid email or password".into(),
+        ));
+    }
     let email = body.email.trim().to_lowercase();
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
