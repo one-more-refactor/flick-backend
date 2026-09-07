@@ -1357,7 +1357,7 @@ async fn friends_scoreboard_and_wrapped() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    // Self-add 409, unknown 404.
+    // Self-add 409, unknown 404, oversized 400.
     let resp = send(
         &app,
         json_request(
@@ -1380,6 +1380,17 @@ async fn friends_scoreboard_and_wrapped() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/friends/add",
+            Some(&bob),
+            json!({"code": "x".repeat(100)}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Bob's scoreboard: himself (me) + alice with her aggregate words.
     let rows = body_json(send(&app, bare_request("GET", "/api/friends", Some(&bob))).await).await;
@@ -3591,7 +3602,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3617,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(

@@ -49,6 +49,10 @@ pub async fn add(
     AppJson(body): AppJson<AddBody>,
 ) -> Result<StatusCode, AppError> {
     let code = body.code.trim().trim_start_matches("/f/").to_string();
+    // Guard against DB query overhead and resource exhaustion DoS from oversized codes.
+    if code.is_empty() || code.len() > 64 {
+        return Err(AppError::bad_request("invalid friend code"));
+    }
     let now = now_secs();
     let uid = user.id.clone();
     let added = state
