@@ -916,6 +916,97 @@ async fn login_code_roundtrip() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn login_and_auth_endpoints_reject_oversized_inputs() {
+    let (app, _dir) = test_app();
+
+    let long_email = format!("{}@example.com", "x".repeat(300));
+    let long_password = "p".repeat(5000);
+
+    // /api/auth/login rejects oversized email or password with 401
+    for (e, p) in [
+        (long_email.as_str(), "hunter22hunter22"),
+        ("user@example.com", long_password.as_str()),
+    ] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/login",
+                None,
+                json!({"email": e, "password": p}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // /api/admin/login rejects oversized email or password with 401
+    for (e, p) in [
+        (long_email.as_str(), "hunter22hunter22"),
+        ("admin@example.com", long_password.as_str()),
+    ] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/admin/login",
+                None,
+                json!({"email": e, "password": p}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // /api/auth/lookup handles oversized email safely
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["exists"], false);
+    assert_eq!(body["methods"], json!([]));
+
+    // /api/auth/code/request handles oversized email safely
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // /api/auth/code/verify rejects oversized email or code
+    for (e, c) in [
+        (long_email.as_str(), "123456"),
+        ("user@example.com", "c".repeat(500).as_str()),
+    ] {
+        let resp = send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/code/verify",
+                None,
+                json!({"email": e, "code": c}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 // ------------------------------------------------ v0.3: accent + lang
 
 #[tokio::test]
@@ -3591,7 +3682,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3697,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
