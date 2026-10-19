@@ -27,6 +27,8 @@ use openidconnect::{
     TokenResponse,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::sync::OnceCell;
 
 use crate::auth::{merge_guest_from_request, new_user, random_token, start_session, user_json};
@@ -126,6 +128,13 @@ fn callback_url(config: &Config, provider: &str) -> String {
         "oidc" => format!("{}/api/auth/oidc/callback", config.public_url),
         p => format!("{}/api/auth/oauth/{p}/callback", config.public_url),
     }
+}
+
+/// Compare two secrets without leaking length or timing information.
+fn constant_eq(a: &str, b: &str) -> bool {
+    let a_hash = Sha256::digest(a.as_bytes());
+    let b_hash = Sha256::digest(b.as_bytes());
+    bool::from(a_hash.ct_eq(&b_hash))
 }
 
 // ------------------------------------------------------- state cookies
@@ -272,7 +281,7 @@ async fn oidc_callback(
     else {
         return Err(AppError::bad_request("malformed OAuth state cookie"));
     };
-    if saved_state != returned_state {
+    if !constant_eq(saved_state, returned_state) {
         return Err(AppError::bad_request("OAuth state mismatch"));
     }
 
@@ -394,7 +403,7 @@ async fn github_callback(
         .ok_or_else(|| AppError::bad_request("missing OAuth state parameter"))?;
     let cookie = crate::auth::cookie_value(headers, &state_cookie_name("github"))
         .ok_or_else(|| AppError::bad_request("missing or expired OAuth state cookie"))?;
-    if cookie != *returned_state {
+    if !constant_eq(&cookie, returned_state) {
         return Err(AppError::bad_request("OAuth state mismatch"));
     }
 
