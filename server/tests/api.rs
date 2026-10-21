@@ -3591,7 +3591,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3606,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
@@ -3615,4 +3623,74 @@ async fn import_html_rejects_non_http_urls() {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {url}");
     }
+}
+
+#[tokio::test]
+async fn auth_and_admin_input_lengths_are_bounded() {
+    let (app, _dir) = test_app();
+    let long_email = format!("{}@example.com", "x".repeat(300));
+    let long_password = "x".repeat(5000);
+    let long_code = "x".repeat(100);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({"email": "user@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/admin/login",
+            None,
+            json!({"email": "admin@example.com", "password": long_password}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/lookup",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = body_json(resp).await;
+    assert_eq!(body["exists"], false);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": long_email}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "user@example.com", "code": long_code}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
