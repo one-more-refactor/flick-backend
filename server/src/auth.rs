@@ -88,13 +88,20 @@ fn hash_ip(ip: &str) -> String {
     }
 }
 
-/// Constant-time equality so code verification can't be timed byte-by-byte.
+/// Compare two secret byte slices in constant time without leaking length or timing
+/// information. Digests both inputs to fixed 32-byte SHA-256 hashes first so
+/// length mismatches perform identical work and do not return early.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).unwrap_u8() == 1
+    let a_hash = Sha256::digest(a);
+    let b_hash = Sha256::digest(b);
+    bool::from(a_hash.ct_eq(&b_hash))
+}
+
+/// Compare two secret strings in constant time without leaking length or timing
+/// information.
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
+    ct_eq(a.as_bytes(), b.as_bytes())
 }
 
 /// Extract a cookie value from request headers.
@@ -770,4 +777,22 @@ pub async fn providers(State(state): State<AppState>) -> Json<Value> {
         providers.push(json!({"id": "github", "name": "GitHub"}));
     }
     Json(json!({ "providers": providers }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_eq_matches_identical_strings() {
+        assert!(constant_eq("secret_token_123", "secret_token_123"));
+        assert!(constant_eq("", ""));
+    }
+
+    #[test]
+    fn test_constant_eq_rejects_differing_strings() {
+        assert!(!constant_eq("secret_token_123", "secret_token_124"));
+        assert!(!constant_eq("secret_token_123", "secret_token"));
+        assert!(!constant_eq("secret_token_123", ""));
+    }
 }
