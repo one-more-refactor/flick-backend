@@ -272,7 +272,7 @@ async fn oidc_callback(
     else {
         return Err(AppError::bad_request("malformed OAuth state cookie"));
     };
-    if saved_state != returned_state {
+    if !crate::auth::constant_eq(saved_state, returned_state) {
         return Err(AppError::bad_request("OAuth state mismatch"));
     }
 
@@ -394,7 +394,7 @@ async fn github_callback(
         .ok_or_else(|| AppError::bad_request("missing OAuth state parameter"))?;
     let cookie = crate::auth::cookie_value(headers, &state_cookie_name("github"))
         .ok_or_else(|| AppError::bad_request("missing or expired OAuth state cookie"))?;
-    if cookie != *returned_state {
+    if !crate::auth::constant_eq(&cookie, returned_state) {
         return Err(AppError::bad_request("OAuth state mismatch"));
     }
 

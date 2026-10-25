@@ -97,6 +97,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).unwrap_u8() == 1
 }
 
+/// Constant-time equality for secret strings (tokens, admin keys, OAuth state).
+/// Digesting both strings with SHA-256 first converts any two inputs into
+/// uniform 32-byte arrays; `ct_eq` on the digests is length-oblivious AND
+/// byte-oblivious to prevent timing attacks.
+pub(crate) fn constant_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let a_hash = Sha256::digest(a.as_bytes());
+    let b_hash = Sha256::digest(b.as_bytes());
+    bool::from(a_hash.ct_eq(&b_hash))
+}
+
 /// Extract a cookie value from request headers.
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -770,4 +781,18 @@ pub async fn providers(State(state): State<AppState>) -> Json<Value> {
         providers.push(json!({"id": "github", "name": "GitHub"}));
     }
     Json(json!({ "providers": providers }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_eq() {
+        assert!(constant_eq("secret_token_123", "secret_token_123"));
+        assert!(constant_eq("", ""));
+        assert!(!constant_eq("secret_token_123", "secret_token_124"));
+        assert!(!constant_eq("secret_token_123", "secret_token"));
+        assert!(!constant_eq("secret", "secret_token_123"));
+    }
 }
