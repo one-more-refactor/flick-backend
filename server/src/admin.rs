@@ -12,7 +12,9 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{random_token, sha256_hex, verify_password, DUMMY_HASH};
+use crate::auth::{
+    random_token, sha256_hex, verify_password, DUMMY_HASH, MAX_EMAIL_LEN, MAX_PASSWORD_LEN,
+};
 use crate::db::{self, now_secs};
 use crate::error::{AppError, AppJson, AppPath};
 use crate::AppState;
@@ -94,6 +96,9 @@ pub async fn login(
     AppJson(body): AppJson<LoginBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if email.len() > MAX_EMAIL_LEN || body.password.len() > MAX_PASSWORD_LEN {
+        return Err(AppError::Unauthorized);
+    }
     let user = state.db.call(move |c| db::user_by_email(c, &email)).await?;
 
     let password = body.password;
