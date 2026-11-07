@@ -97,6 +97,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).unwrap_u8() == 1
 }
 
+/// A 429 for the per-email login-code limits, shaped like the middleware's.
+fn too_many(retry_after: u64) -> AppError {
+    AppError::Status(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("too many login code attempts for this address — try again in {retry_after} s"),
+    )
+}
+
 /// Extract a cookie value from request headers.
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -383,6 +391,9 @@ pub async fn code_request(
     AppJson(body): AppJson<CodeRequestBody>,
 ) -> Result<StatusCode, AppError> {
     let email = body.email.trim().to_lowercase();
+    if let Err(retry_after) = state.limiter.check_code_request_email(&email) {
+        return Err(too_many(retry_after));
+    }
     let lookup = email.clone();
     let exists = state
         .db
@@ -417,6 +428,9 @@ pub async fn code_verify(
     AppJson(body): AppJson<CodeVerifyBody>,
 ) -> Result<Response, AppError> {
     let email = body.email.trim().to_lowercase();
+    if let Err(retry_after) = state.limiter.check_code_verify_email(&email) {
+        return Err(too_many(retry_after));
+    }
     let presented_hash = sha256_hex(body.code.trim());
     let now = now_secs();
     let user = state
