@@ -237,6 +237,15 @@ pub(crate) async fn insert_prepared(
         category,
     } = prepared;
 
+    // Control characters never reach storage, whatever the source: every
+    // client echoes titles and words, and a terminal client would execute
+    // an ESC sequence hidden in them.
+    let text = import::strip_controls(&text);
+    let title = title.map(|t| import::strip_controls(&t));
+    let author = author.map(|a| import::strip_controls(&a));
+    let excerpt = excerpt.map(|e| import::strip_controls(&e));
+    let url = url.map(|u| import::strip_controls(&u));
+
     if text.trim().is_empty() {
         return Err(AppError::bad_request("no readable text was found"));
     }
@@ -433,19 +442,17 @@ async fn sniff_bytes(
     })
 }
 
-/// PDF text extraction, panic-guarded like the other parsers.
+/// PDF text extraction, in a sandboxed child process (`extract.rs`):
+/// pdf-extract can overflow the stack or inflate a decompression bomb on a
+/// hostile file, and neither is something `catch_unwind` can contain.
 async fn from_pdf(
     file: Vec<u8>,
     title: Option<String>,
     filename: Option<&str>,
 ) -> Result<Prepared, AppError> {
-    let extracted = tokio::task::spawn_blocking(move || {
-        std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&file))
-    })
-    .await
-    .map_err(AppError::internal)?;
+    let extracted = crate::extract::extract(crate::extract::Kind::Pdf, file).await?;
     let text = match extracted {
-        Ok(Ok(text)) if !text.trim().is_empty() => text,
+        Some(e) if !e.text.trim().is_empty() => e.text,
         _ => {
             return Err(AppError::bad_request(
                 "could not extract text from this PDF",

@@ -5,10 +5,9 @@
 //! clippings, or plain UTF-8. Web imports additionally run readability
 //! extraction (`dom_smoothie`) over fetched or supplied HTML.
 //!
-//! Every parser that can choke on adversarial input (pdf-extract, rbook,
-//! dom_smoothie) runs inside `spawn_blocking` + `catch_unwind`, exactly like
-//! the original pdf-extract path — a malformed upload is a 400, never a panic
-//! that takes down the worker.
+//! pdf-extract and rbook run in a sandboxed child process (`extract.rs`);
+//! dom_smoothie runs inside `spawn_blocking` + `catch_unwind`. A malformed
+//! upload is a 400, never something that takes down the server.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -66,6 +65,11 @@ const EPUB_MIME: &[u8] = b"application/epub+zip";
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
     let bytes = html.as_bytes();
+    // Lowercased once, up front: ASCII lowercasing keeps every byte offset,
+    // so it can be searched at `i` directly. Lowercasing the remaining input
+    // per <script>/<style> tag (as this used to) is quadratic: a few MB of
+    // `<script></script>` kept a CPU busy for minutes.
+    let lower_html = html.to_ascii_lowercase();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'<' {
@@ -82,7 +86,7 @@ pub fn html_to_text(html: &str) -> String {
             if matches!(name.as_str(), "script" | "style") && !raw.starts_with('/') {
                 // Skip to the matching close tag.
                 let close = format!("</{name}");
-                if let Some(end) = html[i..].to_ascii_lowercase().find(&close) {
+                if let Some(end) = lower_html[i..].find(&close) {
                     i += end;
                     // Advance past that close tag's '>'.
                     if let Some(gt) = html[i..].find('>') {
@@ -318,22 +322,29 @@ fn clipping_book_title(line: &str) -> String {
 
 // -------------------------------------------------------------------- EPUB
 
-/// Extract EPUB plaintext + metadata via rbook, panic-guarded. Walks the spine
-/// in reading order, converts each chapter's XHTML to text, and joins with
-/// blank lines so paragraphs survive into the tokenizer.
+/// Extract EPUB plaintext + metadata. The parse itself runs in a sandboxed
+/// child process (see `extract.rs`): rbook inflates zip entries without any
+/// size limit, so a small hostile EPUB can otherwise exhaust server memory.
 pub async fn extract_epub(bytes: Vec<u8>) -> Result<Prepared, AppError> {
-    let parsed = tokio::task::spawn_blocking(move || {
-        std::panic::catch_unwind(move || epub_to_prepared(&bytes))
-    })
-    .await
-    .map_err(AppError::internal)?;
-    match parsed {
-        Ok(Some(prepared)) => Ok(prepared),
+    match crate::extract::extract(crate::extract::Kind::Epub, bytes).await? {
+        Some(e) if !e.text.trim().is_empty() => Ok(Prepared {
+            title: e.title,
+            text: e.text,
+            source: "epub",
+            author: e.author,
+            url: None,
+            favicon: None,
+            excerpt: None,
+            category: Some("book".into()),
+        }),
         _ => Err(AppError::bad_request("could not read this EPUB file")),
     }
 }
 
-fn epub_to_prepared(bytes: &[u8]) -> Option<Prepared> {
+/// Walk the spine in reading order, convert each chapter's XHTML to text, and
+/// join with blank lines so paragraphs survive into the tokenizer. Runs inside
+/// the extraction child.
+pub(crate) fn epub_to_extracted(bytes: &[u8]) -> Option<crate::extract::Extracted> {
     let epub = rbook::Epub::read(std::io::Cursor::new(bytes.to_vec())).ok()?;
     let title = epub
         .metadata()
@@ -348,10 +359,15 @@ fn epub_to_prepared(bytes: &[u8]) -> Option<Prepared> {
         .filter(|a| !a.is_empty());
 
     let mut chapters: Vec<String> = Vec::new();
+    let mut total = 0usize;
     let mut reader = epub.reader();
     while let Some(Ok(content)) = reader.read_next() {
         let text = html_to_text(content.content());
         if !text.trim().is_empty() {
+            total += text.len();
+            if total > crate::extract::MAX_EXTRACTED_TEXT {
+                return None;
+            }
             chapters.push(text);
         }
     }
@@ -359,16 +375,34 @@ fn epub_to_prepared(bytes: &[u8]) -> Option<Prepared> {
     if text.trim().is_empty() {
         return None;
     }
-    Some(Prepared {
+    Some(crate::extract::Extracted {
         title,
-        text,
-        source: "epub",
         author,
-        url: None,
-        favicon: None,
-        excerpt: None,
-        category: Some("book".into()),
+        text,
     })
+}
+
+/// Drop control characters (ESC, BEL, C1 controls such as CSI, NUL, ...) from
+/// stored text. Titles, words and excerpts are echoed to the web client, the
+/// TUI and the admin panel; in a terminal an ESC sequence in a book title is
+/// an injection. Newlines, tabs and carriage returns are kept (paragraph
+/// structure); other whitespace-class controls become a plain space so words
+/// on either side stay separate.
+pub fn strip_controls(s: &str) -> String {
+    if !s
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
+    {
+        return s.to_string();
+    }
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' | '\r' => Some(c),
+            c if c.is_control() && c.is_whitespace() => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 // ----------------------------------------------------- readable extraction
@@ -611,4 +645,27 @@ pub fn looks_like_html(content_type: &str, bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(512)];
     let lower = String::from_utf8_lossy(head).to_ascii_lowercase();
     lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("<body")
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn html_to_text_is_linear_in_script_tags() {
+        // Quadratic before the fix: this input took minutes.
+        let html = "<script>x</script>word ".repeat(250_000);
+        let start = std::time::Instant::now();
+        let text = html_to_text(&html);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(text.split_whitespace().count(), 250_000);
+        assert!(!text.contains('x'));
+    }
+
+    #[test]
+    fn strip_controls_keeps_structure() {
+        assert_eq!(strip_controls("a\u{1b}[31mb\n\tc\r\n"), "a[31mb\n\tc\r\n");
+        assert_eq!(strip_controls("a\u{85}b\u{c}c"), "a b c");
+        assert_eq!(strip_controls("plain"), "plain");
+    }
 }

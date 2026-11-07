@@ -3,8 +3,17 @@ use std::net::SocketAddr;
 use flick_server::{app, config::Config, db::Db, AppState};
 use tracing_subscriber::EnvFilter;
 
+fn main() {
+    // Re-executed as a sandboxed PDF/EPUB extraction child (extract.rs)?
+    // Handle that before any runtime, logging or config is set up.
+    if let Some(kind) = flick_server::extract::child_kind() {
+        std::process::exit(flick_server::extract::run_child(&kind));
+    }
+    serve();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

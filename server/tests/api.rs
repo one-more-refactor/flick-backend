@@ -14,7 +14,15 @@ use flick_server::db::Db;
 use flick_server::ratelimit::{RateLimits, Rule};
 use flick_server::{app, AppState};
 
+/// PDF/EPUB parsing runs in a child process (the server binary re-executed);
+/// inside the test harness the current executable is the test binary, so
+/// point the sandbox at the real one.
+fn use_real_extractor() {
+    flick_server::extract::set_helper(env!("CARGO_BIN_EXE_flick-server"));
+}
+
 fn test_app_with_state() -> (Router, AppState, tempfile::TempDir) {
+    use_real_extractor();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
         edition: Edition::Selfhost,
@@ -54,6 +62,7 @@ fn test_app_with_limits(limits: RateLimits) -> (Router, tempfile::TempDir) {
 /// A test app whose `Config` is customized (used for the integrations
 /// endpoint, which reflects configured keys).
 fn test_app_with_config(mutate: impl FnOnce(&mut Config)) -> (Router, tempfile::TempDir) {
+    use_real_extractor();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = Config {
         edition: Edition::Selfhost,
@@ -3591,7 +3600,11 @@ async fn upload_filename_cannot_set_an_unbounded_title() {
         .as_str()
         .expect("title")
         .to_string();
-    assert!(title.chars().count() <= 200, "title was {} chars", title.chars().count());
+    assert!(
+        title.chars().count() <= 200,
+        "title was {} chars",
+        title.chars().count()
+    );
 }
 
 /// `/import/html` never fetches its url, but it does store and echo it as the
@@ -3602,7 +3615,11 @@ async fn import_html_rejects_non_http_urls() {
     let (app, _dir) = test_app();
     let cookie = register(&app, "importhtml@example.com").await;
 
-    for url in ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd"] {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,<b>x",
+        "file:///etc/passwd",
+    ] {
         let resp = send(
             &app,
             json_request(
@@ -3615,4 +3632,143 @@ async fn import_html_rejects_non_http_urls() {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {url}");
     }
+}
+
+// ------------------------------------------------- hostile uploads (audit)
+
+/// A minimal single-page PDF: `objects` are the bodies of objects 1..=n, with
+/// a correct xref table so pdf-extract reads it without repair.
+fn build_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for off in offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn stream(dict: &str, content: &str) -> Vec<u8> {
+    format!(
+        "<< {dict} /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+    .into_bytes()
+}
+
+fn text_pdf(text: &str) -> Vec<u8> {
+    build_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+           /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        stream("", &format!("BT /F1 12 Tf 72 712 Td ({text}) Tj ET")),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ])
+}
+
+#[tokio::test]
+async fn pdf_upload_extracts_text_through_the_sandbox() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "pdf@example.com").await;
+    let pdf = text_pdf("The harbor was quiet at dawn");
+    let resp = send(&app, upload_request(&cookie, "harbor.pdf", &pdf)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let book = body_json(resp).await;
+    assert_eq!(book["source"], "pdf");
+    assert_eq!(book["title"], "harbor");
+    assert!(book["word_count"].as_i64().expect("count") >= 6);
+}
+
+/// A Form XObject that draws itself sends pdf-extract into unbounded
+/// recursion. In-process that overflowed the stack and aborted the whole
+/// server (catch_unwind cannot catch it); sandboxed it is one failed upload.
+#[tokio::test]
+async fn self_referencing_pdf_is_a_400_not_a_crash() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "recurse@example.com").await;
+    let pdf = build_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+           /Resources << /XObject << /X1 5 0 R >> >> >>"
+            .to_vec(),
+        stream("", "/X1 Do"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 1 1]", "/X1 Do"),
+    ]);
+    let resp = send(&app, upload_request(&cookie, "loop.pdf", &pdf)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Still alive and still extracting.
+    let ok = text_pdf("Still standing after that");
+    let resp = send(&app, upload_request(&cookie, "ok.pdf", &ok)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// 60 KB on the wire, 40 MB of chapter text once inflated: over the
+/// extracted-text cap, so it is refused instead of being tokenized.
+#[tokio::test]
+async fn inflating_epub_is_refused() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "inflate@example.com").await;
+    let bytes = include_bytes!("fixtures/inflated.epub");
+    let resp = send(&app, upload_request(&cookie, "big.epub", bytes)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn control_characters_never_reach_storage() {
+    let (app, _dir) = test_app();
+    let cookie = register(&app, "ansi@example.com").await;
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/books",
+            Some(&cookie),
+            json!({
+                "title": "Clean\u{1b}]0;pwned\u{7} title\u{9b}31m",
+                "text": "one\u{1b}[2J two\u{85}three\u{0}\n\nfour\tfive",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let book = body_json(resp).await;
+    assert_eq!(book["title"], "Clean]0;pwned title31m");
+    let id = book["id"].as_str().expect("id").to_string();
+    let text = body_json(
+        send(
+            &app,
+            bare_request("GET", &format!("/api/books/{id}/text"), Some(&cookie)),
+        )
+        .await,
+    )
+    .await;
+    let words: Vec<String> = text["paragraphs"]
+        .as_array()
+        .expect("paragraphs")
+        .iter()
+        .flat_map(|p| p.as_array().expect("words").clone())
+        .map(|w| w.as_str().expect("word").to_string())
+        .collect();
+    assert_eq!(words, ["one[2J", "two", "three", "four", "five"]);
+    assert!(words.iter().all(|w| !w.chars().any(char::is_control)));
 }
