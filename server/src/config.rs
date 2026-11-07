@@ -98,6 +98,25 @@ fn oauth_creds(prefix: &str) -> Option<OAuthCreds> {
     }
 }
 
+/// Shortest break-glass token accepted. The token is a full admin credential
+/// reachable from the internet, so it has to be unguessable.
+const MIN_ADMIN_TOKEN_LEN: usize = 16;
+
+/// The deploy quadlet ships `FLICK_ADMIN_TOKEN=CHANGE_ME`. A host that kept
+/// the placeholder (or set some other short value) must not end up with a
+/// publicly known admin password: such a token is ignored, with a warning.
+/// Admin *user* sessions keep working either way.
+fn usable_admin_token(token: String) -> Option<String> {
+    if token.eq_ignore_ascii_case("CHANGE_ME") || token.len() < MIN_ADMIN_TOKEN_LEN {
+        tracing::warn!(
+            "FLICK_ADMIN_TOKEN is the placeholder or shorter than {MIN_ADMIN_TOKEN_LEN} \
+             characters; ignoring it (generate one with `openssl rand -hex 32`)"
+        );
+        return None;
+    }
+    Some(token)
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let oidc = match (
@@ -153,7 +172,7 @@ impl Config {
                 .unwrap_or_else(|| "flick <no-reply@localhost>".into()),
             dropbox_app_key: env_var("FLICK_DROPBOX_APP_KEY"),
             google_picker_api_key: env_var("FLICK_GOOGLE_PICKER_API_KEY"),
-            admin_token: env_var("FLICK_ADMIN_TOKEN").filter(|t| !t.is_empty()),
+            admin_token: env_var("FLICK_ADMIN_TOKEN").and_then(usable_admin_token),
             admin_origin: env_var("FLICK_ADMIN_ORIGIN").filter(|t| !t.is_empty()),
             admin_url: env_var("FLICK_ADMIN_URL").filter(|t| !t.is_empty()),
         }
@@ -162,5 +181,19 @@ impl Config {
     /// `Secure` cookie attribute when the public URL is https (TLS in front).
     pub fn cookie_secure(&self) -> bool {
         self.public_url.starts_with("https://")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usable_admin_token;
+
+    #[test]
+    fn placeholder_and_short_admin_tokens_are_ignored() {
+        assert_eq!(usable_admin_token("CHANGE_ME".into()), None);
+        assert_eq!(usable_admin_token("change_me".into()), None);
+        assert_eq!(usable_admin_token("hunter2".into()), None);
+        let real = "3f1c9a0e7b2d4c6a8e1f0b3d5c7a9e2f".to_string();
+        assert_eq!(usable_admin_token(real.clone()), Some(real));
     }
 }
