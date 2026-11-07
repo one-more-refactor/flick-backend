@@ -58,6 +58,13 @@ pub struct RateLimits {
     pub admin_login: Rule,
     pub delete_me: Rule,
     pub export: Rule,
+    /// Login codes requested for one email address, from anywhere. The
+    /// per-IP buckets alone cannot protect a 6-digit code: an attacker with
+    /// many addresses (any IPv6 /64) gets a fresh allowance per address.
+    pub code_request_per_email: Rule,
+    /// Login-code guesses against one email address, across all codes and
+    /// all clients: 10 an hour puts a 6-digit code out of reach.
+    pub code_verify_per_email: Rule,
     /// The MCP endpoint as a whole. Individual tools that cost real work
     /// (`import_url`) also charge their own bucket, so this is only the
     /// coarse "one client, one endpoint" ceiling.
@@ -81,6 +88,8 @@ impl Default for RateLimits {
             delete_me: Rule::new(5, FIVE_MIN),
             export: Rule::new(10, HOUR),
             mcp: Rule::new(300, HOUR),
+            code_request_per_email: Rule::new(5, HOUR),
+            code_verify_per_email: Rule::new(10, HOUR),
         }
     }
 }
@@ -139,6 +148,25 @@ impl RateLimiter {
     /// `POST /api/import/url`, so an agent cannot use MCP to sidestep it.
     pub fn check_import_url(&self, client: &str) -> Result<(), u64> {
         self.check("import_url", self.limits.import_url, client)
+    }
+
+    /// Charge the per-email login-code buckets (keyed by the normalized
+    /// address, whether or not an account exists, so the answer reveals
+    /// nothing about existence).
+    pub fn check_code_request_email(&self, email: &str) -> Result<(), u64> {
+        self.check(
+            "code_request_email",
+            self.limits.code_request_per_email,
+            email,
+        )
+    }
+
+    pub fn check_code_verify_email(&self, email: &str) -> Result<(), u64> {
+        self.check(
+            "code_verify_email",
+            self.limits.code_verify_per_email,
+            email,
+        )
     }
 
     /// Count one request against `(endpoint, client)`. `Ok` = allowed;
@@ -276,8 +304,22 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     }
 }
 
+/// The bucket for a client address. IPv6 clients are bucketed per /64: a
+/// single host or VM is normally handed a whole /64, so keying on the full
+/// address would give one attacker 2^64 separate allowances.
+fn bucket(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let net = std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("{net}/64")
+        }
+    }
+}
+
 /// The rate-limit key for a request: the forwarded client IP when the direct
-/// peer is a trusted proxy, else the peer IP itself. Without `ConnectInfo`
+/// peer is a trusted proxy, else the peer IP itself (IPv6 per /64). Without `ConnectInfo`
 /// (router driven directly, e.g. `oneshot` in tests) the key is `"unknown"`
 /// — never a panic.
 fn client_key(req: &Request) -> String {
@@ -288,10 +330,10 @@ fn client_key(req: &Request) -> String {
     let peer_ip = peer.ip().to_canonical();
     if trusted_proxy(peer_ip) {
         if let Some(client) = client_behind_trusted_peer(req.headers()) {
-            return client.to_canonical().to_string();
+            return bucket(client);
         }
     }
-    peer_ip.to_string()
+    bucket(peer_ip)
 }
 
 // ----------------------------------------------------------- middleware
@@ -318,5 +360,23 @@ pub async fn rate_limit(State(state): State<AppState>, req: Request, next: Next)
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_clients_share_a_bucket_per_64() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(bucket(a), bucket(b));
+        assert_ne!(bucket(a), bucket(c));
+        assert_eq!(bucket(a), "2001:db8:1:2::/64");
+        // IPv4 (and IPv4-mapped IPv6) stay per address.
+        assert_eq!(bucket("203.0.113.7".parse().unwrap()), "203.0.113.7");
+        assert_eq!(bucket("::ffff:203.0.113.7".parse().unwrap()), "203.0.113.7");
     }
 }

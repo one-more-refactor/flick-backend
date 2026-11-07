@@ -3772,3 +3772,85 @@ async fn control_characters_never_reach_storage() {
     assert_eq!(words, ["one[2J", "two", "three", "four", "five"]);
     assert!(words.iter().all(|w| !w.chars().any(char::is_control)));
 }
+
+/// The per-IP limits alone let an attacker with many addresses keep guessing
+/// a 6-digit code forever (request a fresh code, 5 guesses, repeat). Guesses
+/// are now also capped per email address, across codes and clients.
+#[tokio::test]
+async fn login_codes_are_limited_per_email_address() {
+    let limits = RateLimits {
+        code_request_per_email: Rule::new(2, std::time::Duration::from_secs(3600)),
+        code_verify_per_email: Rule::new(3, std::time::Duration::from_secs(3600)),
+        ..RateLimits::default()
+    };
+    let (_, state, _dir) = test_app_with_state();
+    let app = app(state.clone().with_rate_limits(limits));
+    register(&app, "target@example.com").await;
+
+    let request = || {
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": "Target@Example.com "}),
+        )
+    };
+    for _ in 0..2 {
+        assert_eq!(send(&app, request()).await.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(
+        send(&app, request()).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Same answer for an address with no account: no existence oracle.
+    for _ in 0..2 {
+        send(
+            &app,
+            json_request(
+                "POST",
+                "/api/auth/code/request",
+                None,
+                json!({"email": "ghost@example.com"}),
+            ),
+        )
+        .await;
+    }
+    let resp = send(
+        &app,
+        json_request(
+            "POST",
+            "/api/auth/code/request",
+            None,
+            json!({"email": "ghost@example.com"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Guesses: a fresh code does not reset the per-address budget.
+    let code = flick_server::auth::issue_login_code(&state.db, "target@example.com")
+        .await
+        .expect("issue code");
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let verify = |c: &str| {
+        json_request(
+            "POST",
+            "/api/auth/code/verify",
+            None,
+            json!({"email": "target@example.com", "code": c}),
+        )
+    };
+    for _ in 0..3 {
+        assert_eq!(
+            send(&app, verify(wrong)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let code = flick_server::auth::issue_login_code(&state.db, "target@example.com")
+        .await
+        .expect("issue code");
+    assert_eq!(
+        send(&app, verify(&code)).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
