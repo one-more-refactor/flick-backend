@@ -863,6 +863,7 @@ dependencies = [
  "flick-core",
  "http-body-util",
  "lettre",
+ "libc",
  "openidconnect",
  "pdf-extract",
  "rand 0.8.7",

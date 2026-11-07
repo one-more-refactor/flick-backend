@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod discovery;
 pub mod error;
+pub mod extract;
 pub mod import;
 pub mod integrations;
 pub mod mail;
